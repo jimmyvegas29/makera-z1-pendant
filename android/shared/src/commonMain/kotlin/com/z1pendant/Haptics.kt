@@ -6,6 +6,8 @@ interface Haptics {
     var strength: Float
     /** Shown in Settings (what the hardware supports). */
     val description: String
+    /** False when the phone can only vibrate at one strength: then [strength] only switches it on or off. */
+    val strengthAdjustable: Boolean get() = true
 
     /** One detent. */
     fun tick()

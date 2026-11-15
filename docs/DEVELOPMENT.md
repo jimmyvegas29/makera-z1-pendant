@@ -94,6 +94,10 @@ while the machine had little queued.
 ## Haptics
 VibrationEffect composition primitives: TICK per detent, CLICK every 10th, THUD when clicks are dropped
 or blocked, a double click at a soft limit. Strength is in Settings.
+Phones without primitives (the Galaxy S21 has none) get short one-shot pulses at an amplitude that
+follows the strength (12 ms detent, 20 ms every 10th, 40 ms thud, two 20 ms pulses 60 ms apart at a
+limit). A phone without amplitude control either plays the predefined tick/click effects at a fixed
+strength; Settings then says the slider only switches vibration on or off.
 On Android 13+ they play as `USAGE_PHYSICAL_EMULATION` (vibrations that stand in for a hardware part,
 here the handwheel's detents). Without attributes Android files short primitives as touch feedback, and
 the phone's **Touch feedback** switch then silences them; many people turn that off to quiet the

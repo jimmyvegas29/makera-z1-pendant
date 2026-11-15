@@ -89,6 +89,9 @@ fun SettingsScreen(vm: AppViewModel, onClose: () -> Unit) {
 
                 Section("Handwheel & jog")
                 LabeledSlider("Vibration strength", haptic, 0f..1f, "${(haptic * 100).toInt()}%") { vm.setHaptic(it) }
+                if (!vm.haptics.strengthAdjustable)
+                    Text("This phone vibrates at one strength only: the slider switches vibration on or off.",
+                        fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 LabeledSlider("Degrees per click", deg, 6f..30f, "${deg.toInt()}°", steps = 23) { vm.setDegPerClick(it.toInt().toFloat()) }
                 LabeledSlider("Jog batch interval", tick.toFloat(), 20f..120f, "$tick ms", steps = 9) { vm.setTickMs(it.toLong()) }
                 SwitchRow("Volume keys jog ±1 click", volumeJog) { vm.setVolumeJog(it) }
