@@ -71,7 +71,11 @@ class Machine(ProbeSim):
         self.state = "Idle"
         self.homed = False
         self.hold = False
-        self.queue: deque = deque()               # each: (target list, feed mm/min) or ("dwell", s)
+        # M600 in a playing file suspends it ("Pause"); only `resume` / M601 ends that, `~` doesn't
+        # (Z1 2026-11-24). resume moves back to the saved XYZ and restores the spindle.
+        self.suspended = False
+        self.saved = None                         # (mpos, spindle_on) at the suspend
+        self.queue: deque = deque()              # each: (target list, feed mm/min) or ("dwell", s)
         self.cur = None
         self.msgs: list[str] = []                 # pushed to clients as 0x90
         self.wait_since = None                    # when the first block arrived in an empty queue
@@ -121,6 +125,19 @@ class Machine(ProbeSim):
                      "soft_endstop.enable": "true" if self.soft_enabled else "false",
                      **{f"soft_endstop.{a.lower()}_min": f"{self.soft[a][0]:.1f}" for a in "XYZ"}}.get(key)
                 return [f"sd: {key} is set to {v}\r\n" if v else f"sd: {key} is not in config\r\n", "ok\r\n"]
+            if t in ("RESUME", "M601"):
+                ok = ["ok\r\n"] if t == "M601" else []      # console commands get no "ok"
+                if not self.suspended:
+                    return ["Not suspended\r\n"] + ok
+                pos, spin = self.saved
+                self.msgs.append("Resuming playing...\r\n")
+                if spin:
+                    self.spindle_on = True; self.spindle_at = time.monotonic()
+                if list(pos) != list(self.mpos):
+                    self.msgs.append("Restoring saved XYZ positions and state...\r\n")
+                    self.queue.append((list(pos), 1000.0))
+                self.suspended = False; self.saved = None
+                return ["Playing file resumed\r\n"] + ok
             if t.startswith("BUFFER"):
                 self.buffered = text.strip()[6:].strip()
                 return [f"Command buffered: {self.buffered}\n\r\n", "ok\r\n"]
@@ -157,6 +174,13 @@ class Machine(ProbeSim):
                 if self.m211_one_line:
                     return [",".join(parts) + "\n", "ok\r\n"]
                 return [parts[0]] + ["," + p for p in parts[1:]] + ["ok\r\n"]
+            if t == "$#":                            # work offsets, as the firmware prints them (machine coordinates)
+                w = self.wco
+                rows = [f"[G54:{w[0]:.4f},{w[1]:.4f},{w[2]:.4f},{w[3]:.4f},0.0000]\r\n"]
+                rows += [f"[G{n}:0.0000,0.0000,0.0000,0.0000,0.0000]\r\n" for n in range(55, 60)]
+                rows += ["[G28:0.0000,0.0000,0.0000]\r\n", "[G30:0.0000,0.0000,0.0000]\r\n",
+                         "[G92:0.0000,0.0000,0.0000,0.0000,0.0000]\r\n"]
+                return ["".join(rows), "ok\r\n"]
             if t in ("$X", "M999"):
                 if self.state == "Alarm":
                     self.state = "Idle"; self.halt_code = None
@@ -290,6 +314,13 @@ class Machine(ProbeSim):
         0x85 errors, 0x90 info. Spaces inside paths travel as 0x01."""
         parts = text.strip().split(" ")
         cmd, args = parts[0], [a.replace("\x01", " ") for a in parts[1:] if a]
+        if len(text.strip().encode("utf-8")) > 128:
+            # The real board mixes a longer line with an earlier command's leftovers and acts on that
+            # (measured 2026-11-23: 128 bytes work, 129 don't). The sim refuses instead of guessing.
+            if cmd == "ls":
+                return [(0x84, "Load directory finished.\r\n")]
+            what = {"mv": "rename", "rm": "delete", "mkdir": "create directory"}.get(cmd, cmd)
+            return [(0x85, f"Could not {what} /load (line over 128 bytes)\r\n")]
         if cmd == "ls":
             local = self.sd_dir(args[-1] if args and args[-1] != "-s" else "/sd/gcodes")
             lines = []
@@ -317,6 +348,8 @@ class Machine(ProbeSim):
         if cmd == "mv" and len(args) == 2:
             a, b = self.sd_dir(args[0]), self.sd_dir(args[1])
             try:
+                if b and os.path.exists(b):          # FATFS f_rename won't overwrite (FR_EXIST)
+                    raise OSError("exists")
                 os.rename(a, b)
                 return [(0x84, "ok\r\n"), (0x90, f"renamed {args[0]} to {args[1]}\r\n")]
             except (OSError, TypeError):
@@ -393,6 +426,21 @@ class Machine(ProbeSim):
                     self.msgs.append("Done ATC\r\n")
                 j["paused"] += time.time() - t0
                 continue
+            if re.fullmatch(r"M0*600", code):
+                if not self._wait_queue(empty=True):
+                    break
+                with self.lock:
+                    self.saved = (list(self.mpos), self.spindle_on)
+                    self.suspended = True; self.spindle_on = False
+                    self.msgs.append("Suspended, send resume to continue\r\n")
+                t0 = time.time()
+                while True:
+                    with self.lock:
+                        if not self.suspended or self.state == "Alarm" or self.job is not j:
+                            break
+                    time.sleep(0.02)
+                j["paused"] += time.time() - t0
+                continue
             if re.fullmatch(r"M0*(2|30)", code):
                 break
             self.line(raw)
@@ -422,6 +470,7 @@ class Machine(ProbeSim):
     def _alarm(self, msg):
         self.queue.clear()
         self.cur = None
+        self.suspended = False; self.saved = None
         self.state = "Alarm"
         self.msgs.append(f"ALARM: {msg}\r\n")
 
@@ -469,6 +518,9 @@ class Machine(ProbeSim):
                     continue
                 if self.hold:
                     self.state = "Hold"
+                    continue
+                if self.suspended:
+                    self.state = "Pause"
                     continue
                 if self.cur is None and self.queue:
                     if self.state != "Run":

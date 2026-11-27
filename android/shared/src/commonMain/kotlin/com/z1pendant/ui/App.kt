@@ -49,8 +49,14 @@ fun App(vm: AppViewModel) {
     var console by remember { mutableStateOf(false) }
     var files by remember { mutableStateOf(false) }
     var probing by remember { mutableStateOf(false) }
+    /** The bed map ("Go to") is open. */
+    var mapOpen by remember { mutableStateOf(false) }
     /** The probe wizard was opened from the Run flow's Custom origin: it goes back there. */
     var probeFromRun by remember { mutableStateOf(false) }
+    /** Settings › Anchors is open (over Settings). */
+    var anchorsOpen by remember { mutableStateOf(false) }
+    /** The probe wizard was opened from Settings › Anchors: it goes back there. */
+    var probeFromAnchors by remember { mutableStateOf(false) }
     val runActive by vm.run.active.collectAsState()
     val runPick by vm.runPick.collectAsState()
     var meshOpen by remember { mutableStateOf(false) }
@@ -74,23 +80,28 @@ fun App(vm: AppViewModel) {
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize()) {
         // Full-screen pages live in the activity window (not Dialogs) so dispatchKeyEvent sees
         // every button press, which the "press any button to bind" flow relies on.
-        vm.onMainScreen = !(editorOpen || settings || console || probing || files || runActive || runPick)
+        vm.onMainScreen = !(editorOpen || settings || anchorsOpen || console || probing || mapOpen || files || runActive || runPick)
         // Windows 600 dp or wider (iPad, Android tablet) get the wide layout; see LocalWide.
         androidx.compose.runtime.CompositionLocalProvider(LocalWide provides (maxWidth >= 600.dp),
             LocalLandscape provides (maxWidth >= 840.dp && maxWidth > maxHeight)) {
             when {
                 editorOpen -> HotkeyEditor(vm, editing) { editorOpen = false; editing = null; vm.capture.value = null }
-                settings -> SettingsScreen(vm) { settings = false }
-                console -> ConsoleScreen(vm) { console = false }
-                probing -> ProbeWizard(vm, doneLabel = if (probeFromRun) "Next" else "Done", requireZero = probeFromRun) { zeroSet ->
+                // Before Settings: Anchors opens the wizard from over Settings.
+                probing -> ProbeWizard(vm, doneLabel = if (probeFromRun || probeFromAnchors) "Next" else "Done",
+                    requireZero = probeFromRun || probeFromAnchors, offerAnchor = !probeFromAnchors) { zeroSet ->
                     probing = false
-                    if (probeFromRun) { probeFromRun = false; vm.run.probeReturned(zeroSet) }
+                    if (probeFromRun) { probeFromRun = false; vm.run.probeReturned('X' in zeroSet || 'Y' in zeroSet) }
+                    if (probeFromAnchors) { probeFromAnchors = false; vm.anchors.probeReturned(zeroSet) }
                 }
+                mapOpen -> MapScreen(vm) { mapOpen = false }
+                anchorsOpen -> AnchorsScreen(vm, onProbe = { probeFromAnchors = true; probing = true }) { anchorsOpen = false }
+                settings -> SettingsScreen(vm, onAnchors = { anchorsOpen = true }) { settings = false }
+                console -> ConsoleScreen(vm) { console = false }
                 runActive -> RunScreen(vm, onProbe = { probeFromRun = true; probing = true })
                 files || runPick -> FilesScreen(vm, pickForRun = runPick && !files,
                     onRun = { p -> files = false; vm.runPick.value = false; vm.run.open(p) }) { files = false; vm.runPick.value = false }
                 else -> MainScreen(vm, onSettings = { settings = true }, onConsole = { console = true }, onFiles = { files = true },
-                    onEdit = { editing = it; editorOpen = true }, scroll = mainScroll, onProbe = { probing = true })
+                    onEdit = { editing = it; editorOpen = true }, scroll = mainScroll, onProbe = { probing = true }, onMap = { mapOpen = true })
             }
         }
         if (vm.onMainScreen) ToolChangePopup(vm)
@@ -104,6 +115,10 @@ fun App(vm: AppViewModel) {
         jobActive = vm.link.status.collectAsState().value?.job != null)
     val alarmSheet by vm.alarmSheet.collectAsState()
     if (alarmSheet) AlarmSheet(vm)
+    // A newer release: the startup check's dialog waits for the main screen; What's new (Settings) shows at once.
+    vm.updates.prompt.collectAsState().value?.let { p ->
+        if (!p.auto || vm.onMainScreen) UpdateDialog(vm.updates, p)
+    }
     // A leveling grid found on connect (Idle, no job): it shifts Z everywhere until cleared.
     vm.meshPrompt.collectAsState().value?.let { max ->
         AlertDialog(onDismissRequest = {},

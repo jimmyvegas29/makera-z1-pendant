@@ -10,9 +10,14 @@ The part, in machine coordinates:
   * the table at Z -95, the tool setter at X -9.69 Y -13.58 (the probe touches it at Z -69.637)
 The probe ball is 2 mm (radius 1). `simprobe dead` / `simprobe ok` makes the probe never trigger.
 `simprobe len <dz>` makes the setter trip dz mm higher (another probe's length; the laser probe is about -9).
+`simprobe skew <deg>` turns the part (block and pocket) about the block's center, counter-clockwise seen
+from above; `simprobe lean <deg>` makes the block's sides flare out going down (wider at the bottom);
+`simprobe bow <mm>` makes the block's sides hollow: each side sits <mm> further in at its middle, curving
+back out to the corners. They're for edge probing's multi-point measurement (angle and straightness).
 """
 from __future__ import annotations
 
+import math
 import re
 import threading
 import time
@@ -26,9 +31,23 @@ CHANGE_XY = (-9.89, -13.58)                            # anchor1 + toolrack_offs
 PROBE_TOOLS = (0, 9999)
 
 
-def surface(x: float, y: float) -> float:
+SHAPE = {"skew": 0.0, "lean": 0.0, "bow": 0.0}      # degrees (simprobe skew / lean), mm (simprobe bow)
+
+
+def surface(x: float, y: float, z: float | None = None) -> float:
     x0, x1, y0, y1, top = STOCK
     px0, px1, py0, py1, floor = POCKET
+    if SHAPE["skew"]:                                  # into the part's own (unturned) frame
+        a = -math.radians(SHAPE["skew"]); cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        x, y = cx + (x - cx) * math.cos(a) - (y - cy) * math.sin(a), cy + (x - cx) * math.sin(a) + (y - cy) * math.cos(a)
+    if SHAPE["lean"] and z is not None and z < top:    # the sides flare out below the top
+        g = (top - z) * math.tan(math.radians(SHAPE["lean"]))
+        x0, x1, y0, y1 = x0 - g, x1 + g, y0 - g, y1 + g
+    if SHAPE["bow"]:                                    # hollow sides: in by "bow" mid-side, 0 at the corners
+        cx, cy, hx, hy = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
+        gx = SHAPE["bow"] * max(0.0, 1 - ((y - cy) / hy) ** 2)
+        gy = SHAPE["bow"] * max(0.0, 1 - ((x - cx) / hx) ** 2)
+        x0, x1, y0, y1 = x0 + gx, x1 - gx, y0 + gy, y1 - gy
     if x0 <= x <= x1 and y0 <= y <= y1:
         return floor if (px0 <= x <= px1 and py0 <= y <= py1) else top
     return TABLE
@@ -36,10 +55,10 @@ def surface(x: float, y: float) -> float:
 
 def blocked(x: float, y: float, z: float) -> bool:
     """The ball (tip at z, center z + r) would be inside the part here."""
-    if z < surface(x, y) - 1e-6:
+    if z < surface(x, y, z) - 1e-6:
         return True
     for dx, dy in ((TIP_R, 0), (-TIP_R, 0), (0, TIP_R), (0, -TIP_R)):
-        if z + TIP_R * 0.5 < surface(x + dx, y + dy) - 1e-6:
+        if z + TIP_R * 0.5 < surface(x + dx, y + dy, z + TIP_R * 0.5) - 1e-6:
             return True
     return False
 
@@ -136,6 +155,14 @@ class ProbeSim:
             except ValueError:
                 return ["error:simprobe len <dz>\r\n"]
             return [f"sim: setter Z {SETTER[2] + self.setter_dz:.3f}\r\n", "ok\r\n"]
+        for key in ("SKEW", "LEAN", "BOW"):
+            if t.startswith("SIMPROBE" + key):
+                unit = "mm" if key == "BOW" else "deg"
+                try:
+                    SHAPE[key.lower()] = float(t[len("SIMPROBE" + key):])
+                except ValueError:
+                    return [f"error:simprobe {key.lower()} <{unit}>\r\n"]
+                return [f"sim: part {key.lower()} {SHAPE[key.lower()]:g} {unit}\r\n", "ok\r\n"]
         if t.startswith("SIMPROBE"):
             self.probe_dead = "DEAD" in t
             return [f"sim: probe {'dead' if self.probe_dead else 'ok'}\r\n", "ok\r\n"]

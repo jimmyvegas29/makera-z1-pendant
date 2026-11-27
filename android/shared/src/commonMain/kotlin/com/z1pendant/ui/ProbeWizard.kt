@@ -22,11 +22,13 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AddLocationAlt
 import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
@@ -79,7 +81,12 @@ import com.z1pendant.link.ConnState
 import com.z1pendant.link.MachineStatus
 import com.z1pendant.platform.PlatformBackHandler
 import com.z1pendant.probe.Corner
+import com.z1pendant.probe.EdgeFit
+import com.z1pendant.probe.Pick
+import com.z1pendant.probe.Touch
+import com.z1pendant.probe.missingPick
 import com.z1pendant.probe.PROBE_TOOL
+import com.z1pendant.probe.Side
 import com.z1pendant.probe.ProbeKind
 import com.z1pendant.probe.ProbeMode
 import com.z1pendant.probe.ProbeResult
@@ -89,6 +96,7 @@ import com.z1pendant.probe.ProbeTool
 import com.z1pendant.probe.RunState
 import com.z1pendant.probe.ToolAction
 import com.z1pendant.util.Fmt
+import kotlinx.coroutines.launch
 
 private val TileBg = Color(0xFF1E293B)
 private val TileOn = Color(0xFF132A3E)
@@ -107,9 +115,11 @@ private val WarnFg = Color(0xFFFDE68A)
 @Composable
 /**
  * [requireZero]: opened from Run's 3D probe origin. The finish button ([doneLabel], "Next") only
- * goes on once an X or Y work zero has been set. [onClose] gets whether one was.
+ * goes on once an X or Y work zero has been set. [onClose] gets the work zero axes the run set (and
+ * that weren't put back), empty if none.
  */
-fun ProbeWizard(vm: AppViewModel, doneLabel: String = "Done", requireZero: Boolean = false, onClose: (zeroSet: Boolean) -> Unit) {
+fun ProbeWizard(vm: AppViewModel, doneLabel: String = "Done", requireZero: Boolean = false, offerAnchor: Boolean = true,
+                onClose: (zeroSet: Set<Char>) -> Unit) {
     val p = vm.probe
     var step by remember { mutableStateOf(1) }
     val setup by p.setup.collectAsState()
@@ -117,8 +127,8 @@ fun ProbeWizard(vm: AppViewModel, doneLabel: String = "Done", requireZero: Boole
     var info by remember { mutableStateOf(false) }
     var askRun by remember { mutableStateOf(false) }
     val running = run is RunState.Running
-    fun finish(zeroSet: Boolean) { if (!running) { p.closeWizard(); onClose(zeroSet) } }
-    fun close() = finish(false)
+    fun finish(zeroSet: Set<Char>) { if (!running) { p.closeWizard(); onClose(zeroSet) } }
+    fun close() = finish(emptySet())
     // Each step's Next only once that step is satisfied; nothing moves on while the probe is being loaded or calibrated.
     val action by p.toolAction.collectAsState()
     val acting = action?.let { it.stage != ToolAction.Stage.DONE && it.error == null } == true
@@ -126,8 +136,15 @@ fun ProbeWizard(vm: AppViewModel, doneLabel: String = "Done", requireZero: Boole
     val len by p.lengthCheck.collectAsState()
     val status by vm.link.status.collectAsState(); val linkConn by vm.link.conn.collectAsState()
     val probeReady = linkConn == ConnState.Connected && status?.tool == PROBE_TOOL && confirmed && calibrated && !acting && len?.ok != false
+    val picks by p.picks.collectAsState()
+    val limits by vm.softLimits.collectAsState()
+    val scroll = rememberScrollState()
     LaunchedEffect(run) { if (run !is RunState.Idle) step = 5 }
     LaunchedEffect(Unit) { p.openWizard() }
+    // The bed map, from Move the probe into place: over the wizard, which keeps its place (step,
+    // calibration) underneath. Its own back / close returns here.
+    var showMap by remember { mutableStateOf(false) }
+    if (showMap) { MapScreen(vm) { showMap = false }; return }
     PlatformBackHandler { when { running -> {}; step in 2..4 -> step--; else -> close() } }
 
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
@@ -149,16 +166,16 @@ fun ProbeWizard(vm: AppViewModel, doneLabel: String = "Done", requireZero: Boole
             Icon(Icons.Filled.Info, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(19.dp))
             Spacer(Modifier.width(6.dp)); Text("How these work", color = MaterialTheme.colorScheme.primary, fontSize = 14.sp)
         }
-        Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.weight(1f).verticalScroll(scroll), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             when (step) {
                 // The start offsets are measured from where the probe is parked, so you set them
                 // after moving it into place.
-                1 -> StepWhat(setup) { p.update(it) }
+                1 -> StepWhat(setup, picks, scroll, requireZero, { p.update(it) }, { p.pick(it) }, { p.unpick(it) })
                 2 -> StepCheck(vm)
-                3 -> StepPosition(vm, setup, probeReady, onEdit = { step = 1 })
-                4 -> { StepSettings(setup) { p.update(it) }; ModeAndStatus(vm) }
+                3 -> StepPosition(vm, setup, probeReady) { vm.haptics.press(); showMap = true }
+                4 -> { StepSettings(vm, setup) { p.update(it) }; ModeAndStatus(vm) }
                 // Probe again keeps the calibration (the probe stayed in), unless the run lost it (no touch).
-                else -> StepResult(vm, run, doneLabel, requireZero, onAgain = { p.reset(); step = if (p.calibrated.value) 3 else 2 }, onDone = ::finish)
+                else -> StepResult(vm, run, doneLabel, requireZero, offerAnchor, onAgain = { p.reset(); step = if (p.calibrated.value) 3 else 2 }, onDone = ::finish)
             }
         }
         // While probing: Stop, pinned at the bottom where your thumb is.
@@ -173,11 +190,15 @@ fun ProbeWizard(vm: AppViewModel, doneLabel: String = "Done", requireZero: Boole
         if (step in 1..4) Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (step > 1) PendantOutlinedButton(onClick = { step-- }, modifier = Modifier.weight(1f).height(48.dp)) { Text("Back", fontSize = 16.sp) }
             when (step) {
-                1 -> Button(onClick = { step++ }, modifier = Modifier.weight(1f).height(48.dp)) { Text("Next", fontSize = 16.sp) }
+                // Next waits until every choice this operation needs is picked, and says which one.
+                1 -> { val missing = setup.missingPick(picks)
+                    Button(onClick = { step++ }, enabled = missing == null, modifier = Modifier.weight(1f).height(48.dp)) { Text(missing ?: "Next", fontSize = 16.sp) } }
                 2, 3 -> Button(onClick = { step++ }, enabled = probeReady, modifier = Modifier.weight(1f).height(48.dp)) { Text("Next", fontSize = 16.sp) }
                 4 -> {
-                    val mode by p.mode.collectAsState()
-                    val ready = probeReady && status?.isIdle == true && settingsValid(setup) && setup.startProblem(status?.wpos?.getOrNull(2)) == null
+                    val modeNow by p.mode.collectAsState()
+                    val mode = if (setup.multi) ProbeMode.MEASURE else modeNow
+                    val ready = probeReady && status?.isIdle == true && settingsValid(setup) && setup.startProblem(status?.wpos?.getOrNull(2)) == null &&
+                        setup.travelCheck(status?.let(::startOf), limits).problem == null
                     Button(onClick = { askRun = true }, enabled = ready, modifier = Modifier.weight(1f).height(48.dp)) {
                         Icon(Icons.Filled.PlayArrow, null); Spacer(Modifier.width(4.dp))
                         Text(if (mode == ProbeMode.MEASURE) "Measure" else "Run probe", fontSize = 16.sp)
@@ -188,7 +209,7 @@ fun ProbeWizard(vm: AppViewModel, doneLabel: String = "Done", requireZero: Boole
     }
 
     if (askRun) {
-        val mode = p.mode.value
+        val mode = p.effectiveMode(setup)
         AlertDialog(onDismissRequest = { askRun = false },
             title = { Text("Start probing?") },
             text = {
@@ -213,8 +234,15 @@ fun ProbeWizard(vm: AppViewModel, doneLabel: String = "Done", requireZero: Boole
 
 private fun zeroAxesText(s: ProbeSetup) = s.axesText()
 
+/** Where the probe is parked, in machine coordinates (what the run starts from). */
+private fun startOf(st: MachineStatus) = Touch(st.mpos[0], st.mpos[1], st.mpos[2])
+
 private fun settingsValid(s: ProbeSetup) = s.x in 0.5..200.0 && s.y in 0.5..200.0 && s.depth in 0.0..30.0 &&
-    s.tip in 0.2..12.0
+    s.tip in 0.2..12.0 && (!s.multi || lengthProblem(s) == null)
+
+/** Why the multi-point length won't do (null = fine). */
+private fun lengthProblem(s: ProbeSetup): String? =
+    if (s.edgeLength !in 0.5..300.0) "Total length: 0.5 to 300 mm." else null
 
 // ---- step 1: what ------------------------------------------------------------------------------
 @Composable
@@ -228,8 +256,19 @@ private fun Tile(selected: Boolean, onClick: () -> Unit, modifier: Modifier = Mo
 @Composable
 private fun Label(t: String) = Text(t, fontSize = 12.sp, color = Muted)
 
+/**
+ * Setup: the probe (remembered), then the operation and its choices. Nothing but the probe is picked
+ * when probing opens; each answer reveals the next question and scrolls it into view, and Next
+ * waits for all of them ([Pick], [missingPick]).
+ */
 @Composable
-private fun StepWhat(s: ProbeSetup, onChange: (ProbeSetup) -> Unit) {
+private fun StepWhat(s: ProbeSetup, picks: Set<Pick>, scroll: ScrollState, requireZero: Boolean, onChange: (ProbeSetup) -> Unit,
+                     onPick: (Pick) -> Unit, onUnpick: (Pick) -> Unit) {
+    val opPicked = Pick.OPERATION in picks
+    // Any answer (a new pick, or a different answer to one already picked) can bring up a row below.
+    LaunchedEffect(picks, s.kind, s.edge, s.edgeFromHere, s.edgeMulti, s.corner) {
+        if (picks.isNotEmpty()) { kotlinx.coroutines.delay(90); scroll.animateScrollTo(scroll.maxValue) }
+    }
     Label("Probe")
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         ProbeTool.entries.forEach { t ->
@@ -248,8 +287,8 @@ private fun StepWhat(s: ProbeSetup, onChange: (ProbeSetup) -> Unit) {
     ProbeKind.entries.chunked(2).forEach { row ->
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             row.forEach { k ->
-                val sel = s.kind == k
-                Tile(sel, { onChange(s.copy(kind = k).normalized()) }, Modifier.weight(1f), enabled = !s.tool.topOnly || k == ProbeKind.TOP) {
+                val sel = opPicked && s.kind == k
+                Tile(sel, { onChange(s.copy(kind = k).normalized()); onPick(Pick.OPERATION) }, Modifier.weight(1f), enabled = !s.tool.topOnly || k == ProbeKind.TOP) {
                     if (k == ProbeKind.HOLE || k == ProbeKind.BLOCK) Row { ProbeKindArt(k, 60.dp); ProbeKindArt(k, 60.dp, square = true) }
                     else ProbeKindArt(k, 64.dp)
                     Text(k.label, fontSize = 14.sp, color = if (sel) MaterialTheme.colorScheme.primary else Color.Unspecified)
@@ -259,23 +298,27 @@ private fun StepWhat(s: ProbeSetup, onChange: (ProbeSetup) -> Unit) {
             if (row.size == 1) Spacer(Modifier.weight(1f))
         }
     }
+    if (!opPicked) return
     if (s.kind.hasCorner) {
-        Label("Corner")
+        Label("Which corner?")
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             listOf(Corner.BACK_LEFT, Corner.BACK_RIGHT, Corner.FRONT_LEFT, Corner.FRONT_RIGHT).forEach { c ->
-                val sel = s.corner == c
-                Tile(sel, { onChange(s.copy(corner = c)) }, Modifier.weight(1f)) {
+                val sel = Pick.CORNER in picks && s.corner == c
+                Tile(sel, { onChange(s.copy(corner = c)); onPick(Pick.CORNER) }, Modifier.weight(1f)) {
                     CornerArt(c, s.kind == ProbeKind.INSIDE, 44.dp)
                     Text(c.label, fontSize = 11.sp, color = if (sel) MaterialTheme.colorScheme.primary else Color.Unspecified)
                 }
             }
         }
+        if (Pick.CORNER !in picks) return
     }
+    if (s.kind == ProbeKind.EDGE) { EdgeChoices(s, picks, requireZero, onChange, onPick, onUnpick); return }
     if (s.kind != ProbeKind.TOP) {
         Label("Axes to probe")
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             // A hole starts inside the hole, so there's no top to touch.
-            listOfNotNull('X', 'Y', 'Z'.takeIf { s.kind.hasTop }).forEach { a ->
+            val axes = listOfNotNull('X', 'Y', 'Z'.takeIf { s.kind.hasTop })
+            axes.forEach { a ->
                 val on = when (a) { 'X' -> s.doX; 'Y' -> s.doY; else -> s.doZ }
                 Tile(on, { onChange(s.toggle(a)) }, Modifier.weight(1f)) {
                     Text((if (on) "✓ " else "") + a, fontSize = 17.sp, fontWeight = FontWeight.Medium,
@@ -287,10 +330,84 @@ private fun StepWhat(s: ProbeSetup, onChange: (ProbeSetup) -> Unit) {
     }
 }
 
+/**
+ * Edge on Setup: which edge, where it starts, 1 or more points, and (more) which way along the edge.
+ * Each row shows once the one before it is answered.
+ */
+@Composable
+private fun EdgeChoices(s: ProbeSetup, picks: Set<Pick>, requireZero: Boolean, onChange: (ProbeSetup) -> Unit, onPick: (Pick) -> Unit,
+                        onUnpick: (Pick) -> Unit) {
+    // Opened for a zero (Run's origin, an anchor): multiple points only measure, so they aren't offered.
+    LaunchedEffect(requireZero, s.edgeMulti) { if (requireZero && s.edgeMulti) onChange(s.copy(edgeMulti = false)) }
+    val primary = MaterialTheme.colorScheme.primary
+    @Composable fun name(t: String, sel: Boolean) = Text(t, fontSize = 13.5.sp, color = if (sel) primary else Color.Unspecified)
+    @Composable fun sub(t: String) = Text(t, fontSize = 11.sp, color = Muted, lineHeight = 14.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+
+    Label("Which edge?")
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        listOf(Side.BACK, Side.FRONT, Side.LEFT, Side.RIGHT).forEach { e ->
+            val sel = Pick.SIDE in picks && s.edge == e
+            // Another edge turns "which way" into a different pair (back / front ↔ left / right): ask again.
+            Tile(sel, { if (e.along != s.edge.along) onUnpick(Pick.DIRECTION); onChange(s.copy(edge = e)); onPick(Pick.SIDE) }, Modifier.weight(1f)) {
+                EdgeArt(e, 44.dp)
+                Text(e.label, fontSize = 11.sp, color = if (sel) primary else Color.Unspecified)
+            }
+        }
+    }
+    if (Pick.SIDE !in picks) return
+
+    Label("Where does it start?")
+    Row(Modifier.height(androidx.compose.foundation.layout.IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        listOf(false to ("Touch the top first" to "over the part, touches the top"),
+            true to ("Start from here" to "beside the part, at touch height")).forEach { (here, t) ->
+            val sel = Pick.START in picks && s.edgeFromHere == here
+            Tile(sel, { onChange(s.copy(edgeFromHere = here)); onPick(Pick.START) }, Modifier.weight(1f).fillMaxHeight()) {
+                StartArt(here, s.tool, Modifier.size(width = 78.dp, height = 46.dp))
+                name(t.first, sel); sub(t.second)
+            }
+        }
+    }
+    if (Pick.START !in picks) return
+
+    Label("Touches")
+    Row(Modifier.height(androidx.compose.foundation.layout.IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        listOfNotNull(false to ("1 point" to "sets ${s.edge.axis}0 on the edge"), (true to ("Multiple points" to "measure only, sets nothing")).takeIf { !requireZero }).forEach { (more, t) ->
+            val sel = Pick.POINTS in picks && s.edgeMulti == more
+            Tile(sel, { onChange(s.copy(edgeMulti = more)); onPick(Pick.POINTS) }, Modifier.weight(1f).fillMaxHeight()) { name(t.first, sel); sub(t.second) }
+        }
+    }
+    if (requireZero) Text("Multiple points only measure, so they aren't offered here: this needs a zero.", fontSize = 12.sp, color = Muted)
+    if (Pick.POINTS !in picks || !s.multi) return
+
+    // The picture turns with the edge and shows the way the touches go once it's picked.
+    Label("Which way along the edge?")
+    val wayPicked = Pick.DIRECTION in picks
+    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(TileBg).padding(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.weight(1f).height(96.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF111A2B)).padding(4.dp)) {
+            EdgePointsArt(s.edge, s.alongSign, 4, Modifier.fillMaxSize(), showWay = wayPicked)
+        }
+        Column(Modifier.width(118.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            // Back first for a left / right edge (it's the top of the drawing), left first for back / front.
+            val signs = if (s.edge.along == 'Y') listOf(1, -1) else listOf(-1, 1)
+            signs.forEach { sign ->
+                val sel = wayPicked && s.alongSign == sign
+                val arrow = when (s.alongWord(sign)) { "right" -> "→"; "left" -> "←"; "back" -> "↑"; else -> "↓" }
+                Box(Modifier.fillMaxWidth().height(40.dp).clip(RoundedCornerShape(8.dp)).background(if (sel) TileOn else Color(0xFF243147))
+                    .border(1.dp, if (sel) primary else Color.Transparent, RoundedCornerShape(8.dp))
+                    .clickable { onChange(s.copy(alongSign = sign)); onPick(Pick.DIRECTION) }, contentAlignment = Alignment.Center) {
+                    Text("$arrow ${s.alongWord(sign).replaceFirstChar { it.uppercase() }}", fontSize = 14.sp, color = if (sel) primary else Color.Unspecified)
+                }
+            }
+        }
+    }
+}
+
 // ---- step 2: settings ------------------------------------------------------------------------
 @Composable
-private fun StepSettings(s: ProbeSetup, onChange: (ProbeSetup) -> Unit) {
-    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+private fun StepSettings(vm: AppViewModel, s: ProbeSetup, onChange: (ProbeSetup) -> Unit) {
+    // An edge has more rows (and its own pictures on each): no big picture, so they all fit.
+    if (s.kind != ProbeKind.EDGE) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
         ProbeKindArt(s.kind, 96.dp, square = false)
     }
     if (!s.doSides) {
@@ -298,53 +415,141 @@ private fun StepSettings(s: ProbeSetup, onChange: (ProbeSetup) -> Unit) {
         return
     }
     Text("Distances are from where the probe is now.", fontSize = 12.5.sp, color = Muted)
-    if (s.doX) NumField(FieldArt.X, s.tool, "X start offset", s.x, 0, s.kind) { onChange(s.copy(x = it)) }
-    if (s.doY) NumField(FieldArt.Y, s.tool, "Y start offset", s.y, 0, s.kind) { onChange(s.copy(y = it)) }
-    if (s.kind != ProbeKind.HOLE) NumField(FieldArt.DEPTH, s.tool, if (s.doZ) "Side depth" else "Side depth below Z0", s.depth, 3) { onChange(s.copy(depth = it)) }
+    val edge = s.kind == ProbeKind.EDGE
+    // Started beside the part it only goes in, so the distance is how far it searches for the edge.
+    val what = if (s.fromHere) "search distance" else "start offset"
+    if (s.doX) NumField(FieldArt.X, s.tool, "X $what", s.x, 0, s.kind, side = s.edge.takeIf { edge }, fromHere = s.fromHere) { onChange(s.copy(x = it)) }
+    if (s.doY) NumField(FieldArt.Y, s.tool, "Y $what", s.y, 0, s.kind, side = s.edge.takeIf { edge }, fromHere = s.fromHere) { onChange(s.copy(y = it)) }
+    if (s.multi) EdgePointsSettings(vm, s, onChange)
+    if (s.kind != ProbeKind.HOLE) {
+        if (s.fromHere) OffField(FieldArt.DEPTH, s.tool, "Side depth", "Off: touches at the probe's current height")
+        else NumField(FieldArt.DEPTH, s.tool, if (s.doZ) "Side depth" else "Side depth below Z0", s.depth, 3) { onChange(s.copy(depth = it)) }
+    }
     NumField(FieldArt.TIP, s.tool, "Tip diameter", s.tip, 3) { onChange(s.copy(tip = it)) }
+}
+
+/**
+ * Edge, multiple points: how many and over how long, side by side with one picture of the touches;
+ * under them the spacing that works out to, and whether every touch is inside the machine's travel
+ * (the ones that aren't turn red in the picture).
+ */
+@Composable
+private fun EdgePointsSettings(vm: AppViewModel, s: ProbeSetup, onChange: (ProbeSetup) -> Unit) {
+    val st by vm.link.status.collectAsState()
+    val lim by vm.softLimits.collectAsState()
+    val check = s.travelCheck(st?.let(::startOf), lim)
+    val primary = MaterialTheme.colorScheme.primary
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(TileBg).padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Box(Modifier.size(width = 98.dp, height = 100.dp).clip(RoundedCornerShape(10.dp)).background(Color(0xFF111A2B))
+                .border(1.dp, Color(0xFF334155), RoundedCornerShape(10.dp)).padding(5.dp)) {
+                EdgePointsArt(s.edge, s.alongSign, s.touchCount, Modifier.fillMaxSize(), check.bad)
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Points", fontSize = 15.sp, modifier = Modifier.weight(1f))
+                    Stepper(s.touchCount, ProbeSetup.MIN_POINTS..ProbeSetup.MAX_POINTS) { onChange(s.copy(edgeCount = it)) }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Total length", fontSize = 15.sp, modifier = Modifier.weight(1f))
+                    MmBox(s.edgeLength, 0, Modifier.width(96.dp)) { onChange(s.copy(edgeLength = it)) }
+                }
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Probe spacing: ", fontSize = 13.sp, color = Muted)
+            Text(mmText(kotlin.math.round(s.spacing * 1000) / 1000.0), fontSize = 13.sp, fontFamily = FontFamily.Monospace, color = if (check.problem == null) primary else ErrFg)
+            Text(" mm", fontSize = 13.sp, color = Muted, modifier = Modifier.weight(1f))
+            if (check.problem == null && st != null) Text("✓ inside travel", fontSize = 12.5.sp, color = Green)
+        }
+        check.problem?.let { Text(it, fontSize = 12.5.sp, color = ErrFg, lineHeight = 16.sp) }
+        lengthProblem(s)?.let { Text(it, fontSize = 12.5.sp, color = ErrFg) }
+        // The angle is only as fine as the probe's repeat over the stretch the touches cover.
+        val noise = com.z1pendant.probe.EdgeFit.noiseDegrees(s.alongOffsets().map { kotlin.math.abs(it) })
+        if (lengthProblem(s) == null && noise >= 0.02) Text("Over ${mmText(s.edgeLength)} mm the angle is good to about ±${Fmt.fixed(noise, 2)}°: a longer length gives a finer angle.",
+            fontSize = 11.5.sp, color = Amber, lineHeight = 15.sp)
+    }
+}
+
+/** − n + for a small whole number in [range]. */
+@Composable
+private fun Stepper(value: Int, range: IntRange, onValue: (Int) -> Unit) {
+    val primary = MaterialTheme.colorScheme.primary
+    Row(Modifier.height(42.dp).clip(RoundedCornerShape(10.dp)).border(1.dp, Color(0xFF5B6474), RoundedCornerShape(10.dp)),
+        verticalAlignment = Alignment.CenterVertically) {
+        @Composable fun btn(t: String, enabled: Boolean, v: Int) =
+            Box(Modifier.width(36.dp).fillMaxHeight().clickable(enabled = enabled) { onValue(v) }, contentAlignment = Alignment.Center) {
+                Text(t, fontSize = 20.sp, color = if (enabled) primary else Color(0xFF475569))
+            }
+        btn("−", value > range.first, value - 1)
+        Text("$value", fontSize = 17.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.width(28.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        btn("+", value < range.last, value + 1)
+    }
+}
+
+/** A setting that doesn't apply here: its picture greyed, the reason in place of the number (nothing shifts). */
+@Composable
+private fun OffField(art: FieldArt, tool: ProbeTool, label: String, why: String) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Box(Modifier.size(width = 98.dp, height = 78.dp).alpha(0.4f).clip(RoundedCornerShape(10.dp)).background(TileBg)
+            .border(1.dp, Color(0xFF334155), RoundedCornerShape(10.dp)).padding(5.dp)) {
+            FieldArtImage(art, Modifier.fillMaxSize(), tool)
+        }
+        Column(Modifier.weight(1f)) {
+            Text(label, fontSize = 15.sp, color = Muted)
+            Text(why, fontSize = 12.5.sp, color = Amber, lineHeight = 16.sp)
+        }
+    }
 }
 
 /** A setting with its drawing in a tile; [decimals] = how it's shown once you leave the box (0 = as typed). */
 @Composable
 private fun NumField(art: FieldArt, tool: ProbeTool, label: String, value: Double, decimals: Int,
-                     kind: ProbeKind = ProbeKind.OUTSIDE, onValue: (Double) -> Unit) {
-    fun show(v: Double) = if (decimals > 0) Fmt.fixed(v, decimals) else mmText(v)
-    var text by remember { mutableStateOf(show(value)) }
+                     kind: ProbeKind = ProbeKind.OUTSIDE, side: Side? = null, fromHere: Boolean = false, onValue: (Double) -> Unit) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Box(Modifier.size(width = 98.dp, height = 78.dp).clip(RoundedCornerShape(10.dp)).background(TileBg)
             .border(1.dp, Color(0xFF334155), RoundedCornerShape(10.dp)).padding(5.dp)) {
-            FieldArtImage(art, Modifier.fillMaxSize(), tool, kind)
+            FieldArtImage(art, Modifier.fillMaxSize(), tool, kind, side, fromHere)
         }
         Text(label, fontSize = 15.sp, modifier = Modifier.weight(1f))
-        // A compact rounded box like the mock-up (Material's text field is tall and square-cornered):
-        // the number right-aligned, "mm" small on its baseline, blue border while editing.
-        var focused by remember { mutableStateOf(false) }
-        val bad = text.toDoubleOrNull() == null
-        val primary = MaterialTheme.colorScheme.primary
-        androidx.compose.foundation.text.BasicTextField(text, { t ->
-            text = t.replace(',', '.')
-            text.toDoubleOrNull()?.let(onValue)
-        }, singleLine = true,
-            textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace, fontSize = 17.sp,
-                color = MaterialTheme.colorScheme.onSurface, textAlign = androidx.compose.ui.text.style.TextAlign.End),
-            cursorBrush = androidx.compose.ui.graphics.SolidColor(primary),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-            modifier = Modifier.width(108.dp).onFocusChanged {
-                focused = it.isFocused
-                if (!it.isFocused) text.toDoubleOrNull()?.let { v -> text = show(v) }
-            },
-            decorationBox = { inner ->
-                Row(Modifier.height(42.dp).clip(RoundedCornerShape(10.dp))
-                    .border(if (focused || bad) 2.dp else 1.dp, if (bad) ErrFg else if (focused) primary else Color(0xFF5B6474), RoundedCornerShape(10.dp))
-                    .padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Row(verticalAlignment = Alignment.Bottom) {
-                        Box(Modifier.weight(1f).alignByBaseline(), contentAlignment = Alignment.CenterEnd) { inner() }
-                        Spacer(Modifier.width(4.dp))
-                        Text("mm", fontSize = 12.sp, color = Muted, modifier = Modifier.alignByBaseline())
-                    }
-                }
-            })
+        MmBox(value, decimals, Modifier.width(108.dp), onValue)
     }
+}
+
+/**
+ * The number box: compact and rounded like the mock-up (Material's text field is tall and
+ * square-cornered), the number right-aligned, "mm" small on its baseline, blue border while editing.
+ */
+@Composable
+private fun MmBox(value: Double, decimals: Int, modifier: Modifier, onValue: (Double) -> Unit) {
+    fun show(v: Double) = if (decimals > 0) Fmt.fixed(v, decimals) else mmText(v)
+    var text by remember { mutableStateOf(show(value)) }
+    var focused by remember { mutableStateOf(false) }
+    val bad = text.toDoubleOrNull() == null
+    val primary = MaterialTheme.colorScheme.primary
+    androidx.compose.foundation.text.BasicTextField(text, { t ->
+        text = t.replace(',', '.')
+        text.toDoubleOrNull()?.let(onValue)
+    }, singleLine = true,
+        textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace, fontSize = 17.sp,
+            color = MaterialTheme.colorScheme.onSurface, textAlign = androidx.compose.ui.text.style.TextAlign.End),
+        cursorBrush = androidx.compose.ui.graphics.SolidColor(primary),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+        modifier = modifier.onFocusChanged {
+            focused = it.isFocused
+            if (!it.isFocused) text.toDoubleOrNull()?.let { v -> text = show(v) }
+        },
+        decorationBox = { inner ->
+            Row(Modifier.height(42.dp).clip(RoundedCornerShape(10.dp))
+                .border(if (focused || bad) 2.dp else 1.dp, if (bad) ErrFg else if (focused) primary else Color(0xFF5B6474), RoundedCornerShape(10.dp))
+                .padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Box(Modifier.weight(1f).alignByBaseline(), contentAlignment = Alignment.CenterEnd) { inner() }
+                    Spacer(Modifier.width(4.dp))
+                    Text("mm", fontSize = 12.sp, color = Muted, modifier = Modifier.alignByBaseline())
+                }
+            }
+        })
 }
 
 // ---- step 3: probe in, calibrated ------------------------------------------------------------
@@ -549,6 +754,10 @@ private fun hint(s: ProbeSetup): String {
         ProbeKind.HOLE -> "Jog the ball into the hole, roughly centered, at least 2 mm below its edge."
         ProbeKind.BLOCK -> "Jog the ball $above above the block, roughly over its center."
         ProbeKind.TOP -> "Jog the ball about 5 mm above where you want Z0."
+        // Only what Setup decided: the numbers (how long a stretch) come on the next screen.
+        ProbeKind.EDGE -> (if (s.fromHere) "Jog the ball beside the ${s.edge.label} edge, a few mm out from it and at the height you want it to touch."
+            else "Jog the ball about 5 mm above the part, about 5 mm in from the ${s.edge.label} edge.") +
+            (if (s.multi) " It touches toward the ${s.alongWord()} from there, so start near the ${s.alongWord(-s.alongSign)} end of the edge." else "")
     } + noZ
 }
 
@@ -559,7 +768,7 @@ private fun sideName(s: ProbeSetup): String = when {
 }
 
 @Composable
-private fun StepPosition(vm: AppViewModel, s: ProbeSetup, probeReady: Boolean, onEdit: () -> Unit) {
+private fun StepPosition(vm: AppViewModel, s: ProbeSetup, probeReady: Boolean, onMap: () -> Unit) {
     val p = vm.probe
     val st by vm.link.status.collectAsState()
     val conn by vm.link.conn.collectAsState()
@@ -580,19 +789,21 @@ private fun StepPosition(vm: AppViewModel, s: ProbeSetup, probeReady: Boolean, o
             enabled = connected, onClick = { vm.wheelClicks(it) }, modifier = Modifier.size(210.dp).align(Alignment.Center))
         else JogPad(vm, step = stepList[si], enabled = connected, modifier = Modifier.align(Alignment.Center))
         ModeButton(padMode, Modifier.align(Alignment.TopStart)) { vm.setJogPad(!padMode) }
+        // The bed map, to get there quicker. Dial: bottom-right, as on the main screen. The pad here
+        // starts at the top (no free row beside the switch), so its empty bottom-left corner.
+        MapButton(if (padMode) Modifier.align(Alignment.BottomStart) else Modifier.align(Alignment.BottomEnd), onMap)
     }
     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(TileBg)) {
         Box(Modifier.width(4.dp).height(56.dp).background(MaterialTheme.colorScheme.primary))
         Text(hint(s), fontSize = 13.5.sp, lineHeight = 18.sp, modifier = Modifier.padding(10.dp))
     }
-    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(TileBg).clickable(onClick = onEdit).padding(horizontal = 10.dp, vertical = 6.dp),
+    // What you picked on Setup, nothing more: the numbers are set on the next screen (Jimmy, 2026-11-27),
+    // so no settings summary and no edit link here (Back goes to Setup).
+    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(TileBg).padding(horizontal = 10.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically) {
         ProbeKindArt(s.kind, 44.dp); Spacer(Modifier.width(10.dp))
-        Column(Modifier.weight(1f)) {
-            Text("${s.tool.label} · ${s.title()}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-            Text(summary(s), fontSize = 12.sp, color = Muted)
-        }
-        Text("edit", color = MaterialTheme.colorScheme.primary, fontSize = 13.sp)
+        Text("${s.tool.label} · " + (if (s.multi) "Edge · ${s.edge.label} · multiple points" else s.title()),
+            fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
     }
     if (!connected) Text("Not connected.", fontSize = 12.sp, color = Amber)
     else if (!probeReady) Text("The probe isn't loaded and calibrated: go back to Check the probe.", fontSize = 12.sp, color = Amber)
@@ -607,7 +818,10 @@ private fun ModeAndStatus(vm: AppViewModel) {
     val mode by p.mode.collectAsState()
     val connected = conn == ConnState.Connected
     Spacer(Modifier.height(4.dp))
-    Row(Modifier.fillMaxWidth().height(44.dp).clip(RoundedCornerShape(12.dp)).border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(12.dp)).padding(3.dp),
+    // Several touches along an edge only measure: there's no one point that would be the zero.
+    if (p.setup.value.multi) Text("Multiple points only measures: your work zero won't change.", fontSize = 12.5.sp, color = Muted,
+        modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+    else Row(Modifier.fillMaxWidth().height(44.dp).clip(RoundedCornerShape(12.dp)).border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(12.dp)).padding(3.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp)) {
         listOf(ProbeMode.SET_ZERO to ("Set work zero" to Icons.Filled.MyLocation), ProbeMode.MEASURE to ("Measure only" to Icons.Filled.SquareFoot)).forEach { (m, li) ->
             val sel = mode == m
@@ -635,16 +849,10 @@ private fun ModeAndStatus(vm: AppViewModel) {
 /** A distance as typed: 20 rather than 20.0, 12.5 stays 12.5. */
 private fun mmText(v: Double) = if (v % 1.0 == 0.0) v.toLong().toString() else Fmt.trimmed4(v)
 
-private fun summary(s: ProbeSetup): String = when {
-    !s.doSides -> "straight down"
-    s.kind == ProbeKind.HOLE -> listOfNotNull("X ${mmText(s.x)}".takeIf { s.doX }, "Y ${mmText(s.y)}".takeIf { s.doY }, "tip ${Fmt.fixed(s.tip, 3)} mm").joinToString(" · ")
-    else -> listOfNotNull("X ${mmText(s.x)}".takeIf { s.doX }, "Y ${mmText(s.y)}".takeIf { s.doY },
-        if (s.doZ) "depth ${Fmt.fixed(s.depth, 3)}" else "depth ${Fmt.fixed(s.depth, 3)} below Z0", "tip ${Fmt.fixed(s.tip, 3)} mm").joinToString(" · ")
-}
-
 // ---- step 5: result --------------------------------------------------------------------------
 @Composable
-private fun StepResult(vm: AppViewModel, run: RunState, doneLabel: String, requireZero: Boolean, onAgain: () -> Unit, onDone: (zeroSet: Boolean) -> Unit) {
+private fun StepResult(vm: AppViewModel, run: RunState, doneLabel: String, requireZero: Boolean, offerAnchor: Boolean, onAgain: () -> Unit,
+                       onDone: (zeroSet: Set<Char>) -> Unit) {
     val st by vm.link.status.collectAsState()
     val conn by vm.link.conn.collectAsState()
     val connected = conn == ConnState.Connected
@@ -685,7 +893,7 @@ private fun StepResult(vm: AppViewModel, run: RunState, doneLabel: String, requi
                 }
             }
         }
-        is RunState.Done -> ResultView(vm, run.result, st, connected, doneLabel, requireZero, onAgain, onDone)
+        is RunState.Done -> ResultView(vm, run.result, st, connected, doneLabel, requireZero, offerAnchor, onAgain, onDone)
         is RunState.Failed -> {
             Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(ErrBg).padding(12.dp), verticalAlignment = Alignment.Top) {
                 Icon(Icons.Filled.Error, null, tint = ErrFg, modifier = Modifier.size(26.dp)); Spacer(Modifier.width(8.dp))
@@ -695,7 +903,7 @@ private fun StepResult(vm: AppViewModel, run: RunState, doneLabel: String, requi
             run.hint?.let { CheckRowIcon(Icons.Filled.Help, "Likely cause", it) }
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                PendantOutlinedButton(onClick = { onDone(false) }, modifier = Modifier.weight(1f).height(48.dp)) { Text(if (requireZero) "Back" else doneLabel, fontSize = 16.sp) }
+                PendantOutlinedButton(onClick = { onDone(emptySet()) }, modifier = Modifier.weight(1f).height(48.dp)) { Text(if (requireZero) "Back" else doneLabel, fontSize = 16.sp) }
                 if (st?.isAlarm == true) Button(onClick = { vm.link.dialect.unlock().forEach { vm.link.sendLine(it) }; onAgain() }, modifier = Modifier.weight(1f).height(48.dp)) {
                     Icon(Icons.Filled.LockOpen, null); Spacer(Modifier.width(4.dp)); Text("Unlock, retry", fontSize = 16.sp)
                 } else Button(onClick = onAgain, modifier = Modifier.weight(1f).height(48.dp)) { Text("Try again", fontSize = 16.sp) }
@@ -727,7 +935,7 @@ private fun Cells(cells: List<Pair<String, Double?>>) {
 
 @Composable
 private fun ResultView(vm: AppViewModel, r: ProbeResult, st: MachineStatus?, connected: Boolean, doneLabel: String, requireZero: Boolean,
-                       onAgain: () -> Unit, onDone: (zeroSet: Boolean) -> Unit) {
+                       offerAnchor: Boolean, onAgain: () -> Unit, onDone: (zeroSet: Set<Char>) -> Unit) {
     val s = r.setup
     var undone by remember { mutableStateOf(false) }
     // Picked to start with: every axis the run measured, the same set Makera's own routine writes in
@@ -748,15 +956,17 @@ private fun ResultView(vm: AppViewModel, r: ProbeResult, st: MachineStatus?, con
         Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { MiniReadout(st, connected, null, Modifier.fillMaxWidth(0.62f)) {} }
     } else {
         Label("From your current zero")
+        val at1 = if (s.multi) " (touch 1)" else ""
         Cells(listOfNotNull(
-            ((if (center) "Center X" else if (s.doY) "Corner X" else "Edge X") to r.zeroX).takeIf { s.doX },
-            ((if (center) "Center Y" else if (s.doX) "Corner Y" else "Edge Y") to r.zeroY).takeIf { s.doY },
+            ((if (center) "Center X" else if (s.doY) "Corner X" else "Edge X$at1") to r.zeroX).takeIf { s.doX },
+            ((if (center) "Center Y" else if (s.doX) "Corner Y" else "Edge Y$at1") to r.zeroY).takeIf { s.doY },
             ("Top Z" to r.top).takeIf { s.doZ }))
     }
     if (center) {
         Label("Measured from the touches")
         Cells(listOf("Width in X" to r.widthX, "Width in Y" to r.widthY))
     }
+    r.fit?.let { EdgeFitView(r, it) }
     if (r.mode == ProbeMode.SET_ZERO && ('X' in r.zeroSet || 'Y' in r.zeroSet) && !undone) {
         Row(Modifier.clickable { vm.probe.undoXY(r); undone = true; vm.haptics.press() }.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Filled.Undo, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(19.dp)); Spacer(Modifier.width(6.dp))
@@ -764,7 +974,7 @@ private fun ResultView(vm: AppViewModel, r: ProbeResult, st: MachineStatus?, con
         }
     }
     if (undone) Text("The old X Y zero is back.", fontSize = 13.sp, color = Muted)
-    if (r.mode == ProbeMode.MEASURE && !didSet) {
+    if (r.mode == ProbeMode.MEASURE && !didSet && !s.multi) {
         val avail = listOfNotNull('X'.takeIf { r.zeroX != null }, 'Y'.takeIf { r.zeroY != null }, 'Z'.takeIf { r.top != null })
         Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(TileBg).padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.Top) {
@@ -794,20 +1004,189 @@ private fun ResultView(vm: AppViewModel, r: ProbeResult, st: MachineStatus?, con
     val xySet = (r.mode == ProbeMode.SET_ZERO && ('X' in r.zeroSet || 'Y' in r.zeroSet) && !undone) ||
         (didSet && ('X' in setAxes || 'Y' in setAxes))
     if (requireZero && !xySet) Text("Set the X/Y work zero to go on.", fontSize = 13.sp, color = Muted)
+    // The axes whose work zero this run left set: Set mode's (minus X/Y if put back), plus any set after Measure.
+    val axes = (if (r.mode == ProbeMode.SET_ZERO) (if (undone) r.zeroSet - 'X' - 'Y' else r.zeroSet) else emptySet()) +
+        (if (didSet) setAxes else emptySet())
+    // Save this spot as a custom anchor right here, instead of going out to Settings › Anchors.
+    // Not from the Anchors screen (it's already making one) and not for multiple points (a measurement).
+    if (offerAnchor && !s.multi && (r.zeroX != null || r.zeroY != null || axes.any { it in "XY" })) SaveAnchorRow(vm, r, axes)
     Spacer(Modifier.height(8.dp))
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         PendantOutlinedButton(onClick = onAgain, modifier = Modifier.weight(1f).height(48.dp)) { Text("Probe again", fontSize = 16.sp) }
-        Button(onClick = { onDone(xySet) }, enabled = !requireZero || xySet, modifier = Modifier.weight(1f).height(48.dp)) {
-            Text(if (!requireZero && r.mode == ProbeMode.MEASURE && !didSet) "$doneLabel, don't set" else doneLabel, fontSize = 16.sp)
+        Button(onClick = { onDone(axes) }, enabled = !requireZero || xySet, modifier = Modifier.weight(1f).height(48.dp)) {
+            Text(if (!requireZero && r.mode == ProbeMode.MEASURE && !didSet && !s.multi) "$doneLabel, don't set" else doneLabel, fontSize = 16.sp)
         }
+    }
+}
+
+/**
+ * "Save as anchor" on the result: a name, and which of X, Y, Z to keep (all the probe found are on
+ * to start; Jimmy, 2026-11-27), with the values that will be saved. If the run set the work zero it's
+ * that zero, read back from the machine when the box opens; otherwise the measured point.
+ */
+@Composable
+private fun SaveAnchorRow(vm: AppViewModel, r: ProbeResult, zeroAxes: Set<Char>) {
+    var asking by remember { mutableStateOf(false) }
+    var saved by remember { mutableStateOf<String?>(null) }
+    var name by remember { mutableStateOf("") }
+    var problem by remember { mutableStateOf<String?>(null) }
+    var point by remember { mutableStateOf<com.z1pendant.run.AnchorsController.Point?>(null) }
+    var keep by remember { mutableStateOf(setOf('X', 'Y', 'Z')) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    saved?.let {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.CheckCircle, null, tint = Green, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(6.dp))
+            Text("Saved as anchor \"$it\".", fontSize = 13.sp, color = Green)
+        }
+        return
+    }
+    PendantOutlinedButton(onClick = {
+        name = ""; problem = null; point = null; keep = setOf('X', 'Y', 'Z'); asking = true
+        scope.launch {
+            val m = r.machine
+            point = vm.anchors.probedPoint(zeroAxes, m.zeroX.takeIf { r.zeroX != null }, m.zeroY.takeIf { r.zeroY != null })
+            if (point == null) problem = "Couldn't read the work zero from the machine."
+        }
+    }, modifier = Modifier.fillMaxWidth().height(44.dp)) {
+        Icon(Icons.Filled.AddLocationAlt, null); Spacer(Modifier.width(6.dp)); Text("Save as anchor", fontSize = 15.sp)
+    }
+    if (asking) {
+        val p = point
+        val have = listOf('X' to p?.x, 'Y' to p?.y, 'Z' to p?.z)
+        val kept = have.filter { (a, v) -> v != null && a in keep }.map { it.first }.toSet()
+        AlertDialog(onDismissRequest = { asking = false },
+            title = { Text("Save as anchor") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(name, { name = it; problem = null }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Text("Save these axes", fontSize = 13.sp, color = Muted)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        have.forEach { (a, v) ->
+                            val found = v != null; val on = found && a in keep
+                            Box(Modifier.weight(1f).height(38.dp).clip(RoundedCornerShape(50)).background(if (on) TileOn else Color.Transparent)
+                                .border(1.5.dp, when { on -> MaterialTheme.colorScheme.primary; found -> Color(0xFF6B7280); else -> Color(0xFF3B4252) }, RoundedCornerShape(50))
+                                .clickable(enabled = found) { keep = if (a in keep) keep - a else keep + a; vm.haptics.press() },
+                                contentAlignment = Alignment.Center) {
+                                Text((if (on) "✓ " else "") + a, fontSize = 15.5.sp, fontWeight = FontWeight.Medium,
+                                    color = when { on -> MaterialTheme.colorScheme.primary; found -> Muted; else -> Color(0xFF4B5160) })
+                            }
+                        }
+                    }
+                    // The values that will be saved (machine coordinates); left-out ones struck through.
+                    if (p != null) Text(androidx.compose.ui.text.buildAnnotatedString {
+                        have.filter { it.second != null }.forEachIndexed { i, (a, v) ->
+                            if (i > 0) append(" · ")
+                            val off = a !in keep
+                            if (off) pushStyle(androidx.compose.ui.text.SpanStyle(textDecoration = androidx.compose.ui.text.style.TextDecoration.LineThrough, color = Color(0xFF5B6170)))
+                            append("$a ${Fmt.fixed(v!!, 3)}")
+                            if (off) pop()
+                        }
+                    }, fontSize = 12.5.sp, fontFamily = FontFamily.Monospace, color = Muted)
+                    else if (problem == null) Text("Reading the work zero…", fontSize = 12.5.sp, color = Muted)
+                    val missing = have.filter { it.second == null }.map { it.first }
+                    when {
+                        p != null && p.z != null && 'Z' !in keep ->
+                            Text("Without Z, a job zeroed here still probes its own Z (stock that changes height).", fontSize = 12.5.sp, color = Muted, lineHeight = 16.sp)
+                        p != null && missing.isNotEmpty() ->
+                            Text("${missing.joinToString(" and ")} ${if (missing.size == 1) "wasn't" else "weren't"} probed, so ${if (missing.size == 1) "it" else "they"} can't be saved.",
+                                fontSize = 12.5.sp, color = Muted, lineHeight = 16.sp)
+                    }
+                    problem?.let { Text(it, fontSize = 12.5.sp, color = ErrFg) }
+                }
+            },
+            confirmButton = { TextButton(enabled = p != null && ('X' in kept || 'Y' in kept), onClick = {
+                problem = vm.anchors.saveProbed(name, p!!, keep)
+                if (problem == null) { saved = name.trim(); asking = false; vm.haptics.press() }
+            }) { Text("Save") } },
+            dismissButton = { TextButton(onClick = { asking = false }) { Text("Cancel") } })
+    }
+}
+
+/**
+ * Edge, multiple points: how far the edge is turned from the machine's axis (a best-fit line through
+ * every touch), in words and numbers; with 3 or more touches, how straight it is, as a number, in
+ * words, as a magnified plot of each touch against the line, and touch by touch.
+ */
+@Composable
+private fun EdgeFitView(r: ProbeResult, f: EdgeFit) {
+    val s = r.setup; val e = s.edge
+    val len = mmText(kotlin.math.round(f.length * 1000) / 1000.0)
+    val mm = Fmt.fixed(kotlin.math.abs(f.delta), 3)
+    val square = kotlin.math.abs(f.delta) < 0.0005
+    val way = if (e.axis == 'Y') (if (f.delta > 0) "further back" else "further forward") else (if (f.delta > 0) "further right" else "further left")
+    val text = if (square) "The ${e.label} edge is square to the machine: over $len mm it doesn't move."
+        else "The ${e.label} edge is ${Fmt.fixed(kotlin.math.abs(f.degrees), 2)}° out. Over $len mm toward the ${s.alongWord()} (${f.n} touches), it runs $mm mm $way."
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(TileBg).padding(12.dp)) {
+        Row(verticalAlignment = Alignment.Top) {
+            Icon(Icons.Filled.SquareFoot, null, tint = Amber, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(10.dp))
+            Text(text, fontSize = 14.5.sp, lineHeight = 19.sp)
+        }
+    }
+    Cells(listOf("Difference" to f.delta, "Angle (°)" to f.degrees, "Per 100 mm" to f.per100))
+    Text((if (f.n > 2) "Angle from a best-fit line through all ${f.n} touches; " else "") +
+        "good to about ±${Fmt.fixed(f.noiseDegrees, if (f.noiseDegrees < 0.01) 3 else 2)}° from the probe's ±${Fmt.fixed(EdgeFit.REPEAT, 3)} mm repeat. " +
+        "Difference is last touch − first along the line, on ${e.axis}.", fontSize = 11.5.sp, color = Muted, lineHeight = 15.sp)
+    f.straightness?.let { StraightnessView(r, f, it) }
+}
+
+@Composable
+private fun StraightnessView(r: ProbeResult, f: EdgeFit, straightness: Double) {
+    val e = r.setup.edge
+    val primary = MaterialTheme.colorScheme.primary
+    val worst = f.offLine.maxOf { kotlin.math.abs(it) }
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(TileBg).padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(verticalAlignment = Alignment.Bottom) {
+            Text("Straightness", fontSize = 15.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+            Text(Fmt.fixed(straightness, 3), fontSize = 18.sp, fontFamily = FontFamily.Monospace)
+            Text(" mm", fontSize = 12.sp, color = Muted)
+        }
+        f.shape()?.let { Text(it, fontSize = 13.5.sp, lineHeight = 18.sp) }
+        // Each touch against the line, magnified so a few microns show: the scale is the larger of
+        // the worst touch and 0.01 mm (the probe's noise), so a straight edge looks straight.
+        val scale = maxOf(worst, 0.01)
+        androidx.compose.foundation.Canvas(Modifier.fillMaxWidth().height(84.dp)) {
+            val w = size.width; val h = size.height; val pad = 14f
+            val mid = h / 2; val amp = h / 2 - pad
+            fun x(i: Int) = if (f.n == 1) w / 2 else pad + (w - 2 * pad) * i / (f.n - 1)
+            fun y(v: Double) = (mid - v / scale * amp).toFloat()
+            drawLine(Color(0xFF24324A), androidx.compose.ui.geometry.Offset(0f, pad), androidx.compose.ui.geometry.Offset(w, pad), 1f)
+            drawLine(Color(0xFF24324A), androidx.compose.ui.geometry.Offset(0f, h - pad), androidx.compose.ui.geometry.Offset(w, h - pad), 1f)
+            drawLine(primary, androidx.compose.ui.geometry.Offset(0f, mid), androidx.compose.ui.geometry.Offset(w, mid), 2f,
+                pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 7f)))
+            for (i in 0 until f.n - 1) drawLine(Amber, androidx.compose.ui.geometry.Offset(x(i), y(f.offLine[i])),
+                androidx.compose.ui.geometry.Offset(x(i + 1), y(f.offLine[i + 1])), 3f)
+            for (i in 0 until f.n) drawCircle(Amber, 7f, androidx.compose.ui.geometry.Offset(x(i), y(f.offLine[i])))
+        }
+        Text("Each touch's distance from the best-fit line (blue), magnified: top and bottom are ±${Fmt.fixed(scale, 3)} mm. + is further out of the part.",
+            fontSize = 11.5.sp, color = Muted, lineHeight = 15.sp)
+        // Touch by touch: how far along, where the edge was (work, from your current zero), how far off the line.
+        val ai = if (e.axis == 'X') 0 else 1
+        Row { listOf("Touch", "Along", "Edge ${e.axis}", "Off line").forEachIndexed { i, h ->
+            Text(h, fontSize = 11.sp, color = Muted, modifier = Modifier.weight(if (i == 0) 0.7f else 1f),
+                textAlign = if (i == 0) androidx.compose.ui.text.style.TextAlign.Start else androidx.compose.ui.text.style.TextAlign.End) } }
+        for (i in 0 until f.n) {
+            val off = f.offLine[i]
+            val edgeW = r.machine.edgeTouches[i] - (r.before.getOrNull(ai) ?: 0.0)
+            Row {
+                Text("${i + 1}", fontSize = 13.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(0.7f))
+                Text(mmText(kotlin.math.round(f.t[i] * 1000) / 1000.0), fontSize = 13.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.End)
+                Text(Fmt.fixed(edgeW, 3), fontSize = 13.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.End)
+                Text(Fmt.fixed(off, 3, plus = true), fontSize = 13.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+                    color = if (kotlin.math.abs(off) >= worst - 1e-9 && worst > 2 * EdgeFit.REPEAT) Amber else Color.Unspecified,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.End)
+            }
+        }
+        Text("The probe repeats to about ±${Fmt.fixed(EdgeFit.REPEAT, 3)} mm, so anything under about 0.01 mm is noise.", fontSize = 11.5.sp, color = Muted, lineHeight = 15.sp)
     }
 }
 
 /** Beside a finished step: what it set (Makera / Top only) or that it was found (Measure only). */
 private fun doneNote(label: String, setMode: Boolean): String? {
     val s = com.z1pendant.probe.Steps
-    if (label == s.CORNER || label == s.EDGE || label == s.CENTER) return null
-    if (!setMode) return "found"
+    if (label == s.CORNER || label == s.EDGE || label == s.CENTER || label == s.BACK_OFF) return null
+    if (!setMode || Regex("""Touch \d+ of \d+""").matches(label)) return "found"
     return when (label) {
         s.TOP -> "Z0 set"
         s.X_SIDE, s.X_WALL, s.X_WALLS, s.X_SIDES -> "X0 set"
@@ -823,6 +1202,7 @@ private fun whereText(r: ProbeResult): String {
         ProbeKind.HOLE -> "at the center of the hole"
         ProbeKind.BLOCK -> "at the center of the block"
         ProbeKind.TOP -> ""
+        ProbeKind.EDGE -> "on the ${s.edge.label} edge"
     }
     return listOfNotNull(xy.takeIf { it.isNotEmpty() }?.let { "$it $place" }, "Z0 on the top".takeIf { 'Z' in z })
         .joinToString(", ").ifEmpty { "Nothing changed." } + "."
@@ -838,10 +1218,12 @@ private fun InfoSheet(step: Int, tool: ProbeTool, onClose: () -> Unit) {
             when (step) {
                 4 -> {
                     InfoItem(FieldArt.X, tool, "X and Y start offset", "You park the probe over the part. It moves out this far, goes down, then comes back in until it touches the edge. Make it more than the distance from where you parked to the edge, plus a few mm. For a hole it's how far it searches each way; for an inside corner, how far it moves into the pocket.")
-                    InfoItem(FieldArt.DEPTH, tool, "Side depth", "How far below the top surface the ball goes before it touches the sides. Decimals are fine (1.5). Go deeper if the edge is rounded or chamfered.")
-                    InfoItem(FieldArt.DEPTH, tool, "Side depth with Z off", "With Z off it doesn't touch the top, so it measures the side depth from your current Z0 instead. Set Z on the top first (Top only); park the ball anywhere above it.")
+                    InfoText("Edge started from here: search distance", "The ball is already beside the part at the height it touches. It moves straight in, at most this far, until it touches the edge, then backs off to where it started. Make it more than the gap to the edge.")
+                    InfoItem(FieldArt.DEPTH, tool, "Side depth", "How far below the top surface the ball goes before it touches the sides. Decimals are fine (1.5). Go deeper if the edge is rounded or chamfered. An edge started from here touches at the height you parked it, so side depth is off.")
+                    InfoItem(FieldArt.DEPTH, tool, "Side depth with Z off", "A corner or block with Z off doesn't touch the top, so it measures the side depth from your current Z0 instead. Set Z on the top first (Top only); park the ball anywhere above it.")
                     InfoItem(FieldArt.TIP, tool, "Tip diameter", "The ball's size. It touches with the side of the ball, so half of this is added to find the real edge. Measure it with calipers if you can.")
-                    InfoText("Axes to probe", "Turn on only the axes you want. Each one that's on is touched and set; the others are left alone.")
+                    InfoText("Edge: multiple points", "It touches the edge where you parked, then again along it, the number of points spread evenly over the total length. A best-fit line through them says how far the edge is turned from the machine's X or Y (use it to square a vise or a part); with 3 or more it also says how straight the edge is. It only measures: your work zero doesn't change. The longer the length, the finer the angle.")
+                    InfoText("Axes to probe", "Corners, hole and block: turn on only the axes you want. Each one that's on is touched and set; the others are left alone.")
                     InfoText("Set work zero", "When the axes match one of Makera's routines (a corner with X, Y and Z, a hole, a block center with Z), it runs Makera's own routine (M480), exactly as Makera Studio does. Anything else, the pendant makes the touches itself and writes only the axes that are on.")
                     InfoText("Measure only", "The pendant makes the same touches itself and doesn't change anything. The next screen shows what it found, and you can set any of the axes as work zero from there.")
                 }

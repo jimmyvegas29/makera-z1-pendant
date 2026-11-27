@@ -269,8 +269,10 @@ private fun OriginStep(vm: AppViewModel, onProbe: () -> Unit) {
     val anchor by r.anchor.collectAsState()
     val probed by r.probed3d.collectAsState()
     val st by vm.link.status.collectAsState()
+    val saved by vm.anchors.list.collectAsState()
     for (o in Origin.entries) {
         val on = s.origin == o
+        if (o == Origin.CUSTOM) { CustomAnchorOption(vm, s, saved, on); continue }
         Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Card)
             .then(if (on) Modifier.border(1.5.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(10.dp)) else Modifier)
             .clickable { r.update(s.withOrigin(o)) }.padding(10.dp)) {
@@ -314,6 +316,95 @@ private fun OriginStep(vm: AppViewModel, onProbe: () -> Unit) {
     }
 }
 
+/** Machine coordinates of an anchor, "X −150.250 · Y −110.600 · Z −82.400" (only the axes it has). */
+fun anchorCoords(a: com.z1pendant.run.Anchor) = listOfNotNull(a.x?.let { "X ${f3(it)}" }, a.y?.let { "Y ${f3(it)}" }, a.z?.let { "Z ${f3(it)}" })
+    .joinToString(" · ").replace('-', '\u2212')
+
+/**
+ * "Custom anchor" with a dropdown of the saved anchors next to it (Jimmy, 2026-11-24: no list of
+ * anchors in Run, no Manage link). Under it when picked: the offset from the anchor and what happens
+ * to Z (the anchor's saved Z, or the Z probe when it has none).
+ */
+@Composable
+private fun CustomAnchorOption(vm: AppViewModel, s: RunSetup, saved: List<com.z1pendant.run.Anchor>, on: Boolean) {
+    val r = vm.run
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val none = saved.isEmpty()
+    // The one shown in the dropdown: the picked one, else the one used last time, else the first.
+    val shown = s.anchor?.let { a -> saved.firstOrNull { it.id == a.id } } ?: saved.firstOrNull { it.id == r.lastAnchorId() } ?: saved.firstOrNull()
+    fun pick(a: com.z1pendant.run.Anchor?) { if (a != null) r.update(s.withAnchor(a)) }
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Card)
+        .then(if (on) Modifier.border(1.5.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(10.dp)) else Modifier)
+        .clickable(enabled = !none) { if (!on) pick(shown) }.padding(10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            RadioButton(selected = on, onClick = { if (!on) pick(shown) }, enabled = !none)
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(Origin.CUSTOM.label, fontWeight = FontWeight.SemiBold, fontSize = 15.sp,
+                        color = if (none) muted else Color.Unspecified)
+                    if (!none) {
+                        Spacer(Modifier.width(8.dp))
+                        var open by remember { mutableStateOf(false) }
+                        Box(Modifier.weight(1f, fill = false)) {
+                            Row(Modifier.clip(RoundedCornerShape(8.dp))
+                                .border(1.dp, if (on) MaterialTheme.colorScheme.primary else Color(0xFF334155), RoundedCornerShape(8.dp))
+                                .clickable { open = true }.padding(start = 10.dp, end = 6.dp, top = 5.dp, bottom = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically) {
+                                Text(shown?.name ?: "", fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                                Text(" \u25BE", fontSize = 13.sp, color = muted)
+                            }
+                            DropdownMenu(open, { open = false }) {
+                                for (a in saved) DropdownMenuItem(
+                                    text = { Column { Text(a.name); Text(anchorCoords(a), fontSize = 11.sp, color = muted) } },
+                                    onClick = { open = false; pick(a) })
+                            }
+                        }
+                    }
+                }
+                Text(if (none) "None saved yet. Add them in Settings \u203A Anchors." else shown?.let { anchorCoords(it) } ?: "",
+                    fontSize = 12.sp, color = muted)
+            }
+        }
+        val a = s.anchor
+        if (on && a != null) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.padding(start = 12.dp, top = 6.dp)) {
+                Text("Offset", fontSize = 13.sp, color = muted)
+                if (a.x != null) SmallNum("X", s.aOffX) { r.update(s.copy(aOffX = it)) }
+                if (a.y != null) SmallNum("Y", s.aOffY) { r.update(s.copy(aOffY = it)) }
+                Text("mm", fontSize = 13.sp, color = muted)
+            }
+            if (a.x == null || a.y == null) Text("This anchor has only ${if (a.x != null) "X" else "Y"}: " +
+                "${if (a.x != null) "Y" else "X"} stays where the work zero is now.", fontSize = 12.sp, color = muted,
+                modifier = Modifier.padding(start = 12.dp, top = 4.dp))
+            if (a.z != null) Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 12.dp, top = 2.dp)) {
+                Text("Use the anchor's saved Z, skip the Z probe", fontSize = 13.sp, modifier = Modifier.weight(1f))
+                Switch(s.useAnchorZ, { r.update(s.copy(useAnchorZ = it, probeZ = false)) })
+            } else Text("No Z saved with this anchor, so Z is probed on the next step (as with Anchor 1).",
+                fontSize = 12.sp, color = muted, modifier = Modifier.padding(start = 12.dp, top = 4.dp))
+        }
+    }
+}
+
+/** A small number box for offsets ("X [ 0 ]"): keeps what you type until it parses. */
+@Composable
+private fun SmallNum(label: String, value: Double, onChange: (Double) -> Unit) {
+    fun show(v: Double) = Fmt.fixed(v, 3).trimEnd('0').trimEnd('.')
+    var text by remember { mutableStateOf(show(value)) }
+    LaunchedEffect(value) { if (text.toDoubleOrNull() != value) text = show(value) }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.width(4.dp))
+        androidx.compose.foundation.text.BasicTextField(text, { t -> text = t; t.toDoubleOrNull()?.let(onChange) }, singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace, fontSize = 15.sp,
+                color = MaterialTheme.colorScheme.onSurface, textAlign = androidx.compose.ui.text.style.TextAlign.End),
+            cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
+            modifier = Modifier.width(72.dp).clip(RoundedCornerShape(7.dp)).border(1.dp, Color(0xFF334155), RoundedCornerShape(7.dp))
+                .background(MaterialTheme.colorScheme.background).padding(horizontal = 7.dp, vertical = 5.dp))
+    }
+}
+
 // ---- step 2: checks ---------------------------------------------------------------------------------------
 @Composable
 private fun ChecksStep(vm: AppViewModel, st: MachineStatus?) {
@@ -328,10 +419,15 @@ private fun ChecksStep(vm: AppViewModel, st: MachineStatus?) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("Probe Z at start", fontWeight = FontWeight.SemiBold)
-                Text(if (s.probeZLocked) "Required with Anchor 1: sets Z zero on the stock top" else "Sets Z zero on the stock top",
+                Text(when {
+                    s.probeZLocked && s.origin == Origin.ANCHOR1 -> "Required with Anchor 1: sets Z zero on the stock top"
+                    s.probeZLocked -> "Required: the anchor doesn't set Z. Sets Z zero on the stock top"
+                    s.anchorSetsZ && !s.zOn -> "Off: Z zero comes from the anchor"
+                    else -> "Sets Z zero on the stock top"
+                },
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            // Locked on with Anchor 1: shown on (not greyed), and a tap does nothing.
+            // Locked on with Anchor 1 (or an anchor without Z): shown on (not greyed), and a tap does nothing.
             Switch(s.zOn, { if (!s.probeZLocked) r.update(s.copy(probeZ = it)) })
         }
         if (s.zOn && e != null) {
@@ -572,9 +668,11 @@ private fun RunStep(vm: AppViewModel, st: MachineStatus?) {
         Row(verticalAlignment = Alignment.Top) {
             Text("Origin", fontSize = 13.sp, color = muted, modifier = Modifier.width(64.dp))
             Column(Modifier.weight(1f)) {
-                Text(s.origin.label, fontSize = 14.sp)
+                Text(s.origin.label + (s.anchor?.takeIf { s.origin == Origin.CUSTOM }?.let { " · ${it.name}" } ?: ""), fontSize = 14.sp)
                 val sub = when (s.origin) {
                     Origin.ANCHOR1 -> "Offset X ${Fmt.trimmed4(s.offX)} · Y ${Fmt.trimmed4(s.offY)} from the bracket's corner"
+                    Origin.CUSTOM -> "Offset X ${Fmt.trimmed4(s.aOffX)} · Y ${Fmt.trimmed4(s.aOffY)} from the anchor" +
+                        if (s.anchorSetsZ) "; Z from the anchor" else ""
                     Origin.CURRENT -> anchor?.let { (ax, ay) -> st?.let { m ->
                         "X ${f3(m.mpos[0] - m.wpos[0] - ax)} · Y ${f3(m.mpos[1] - m.wpos[1] - ay)} from Anchor 1" } }
                     else -> null

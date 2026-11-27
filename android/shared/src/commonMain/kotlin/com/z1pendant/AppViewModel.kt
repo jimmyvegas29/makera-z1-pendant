@@ -63,6 +63,15 @@ class AppViewModel(private val platform: Platform) : ViewModel() {
     /** Files on the Z1's SD card (the Files screen). */
     val files = com.z1pendant.files.FilesController(link, viewModelScope, prefs) { snack.tryEmit(it) }
     val console = MutableStateFlow<List<String>>(emptyList())
+    /** App updates from GitHub (Settings › App, and the dialog at start). */
+    val updates = com.z1pendant.update.UpdateController(prefs, platform.updater, viewModelScope, log = { log(it) }, busy = {
+        val st = link.status.value
+        when {
+            st?.job != null -> "A job is running. Update after it finishes: installing closes the app."
+            st != null && !st.isIdle && !st.isAlarm -> "The machine is moving. Update when it's idle: installing closes the app."
+            else -> null
+        }
+    })
     val confirmFor = MutableStateFlow<Hotkey?>(null)
 
     // ---- spindle ----
@@ -387,6 +396,8 @@ class AppViewModel(private val platform: Platform) : ViewModel() {
     val run = com.z1pendant.run.RunController(link, viewModelScope, prefs, probe,
         onSend = { ownMotion.sent(nowMs()) }, log = { log(it) },
         bed = { softLimits.value.bed ?: com.z1pendant.link.Bed.Z1 })
+    /** Custom anchors (Settings › Anchors; Run's Custom anchor origin), saved per machine. */
+    val anchors = com.z1pendant.run.AnchorsController(link, viewModelScope, prefs, target, log = { log(it) })
     /** Files is open to pick a job to run (the Run tile). */
     val runPick = MutableStateFlow(false)
 
@@ -396,6 +407,7 @@ class AppViewModel(private val platform: Platform) : ViewModel() {
         jog.step = steps[stepIndex.value]
         applyJogConfig()
         jog.start()
+        updates.startupCheck()
         viewModelScope.launch {
             link.messages.collect { m ->
                 log("← $m")
@@ -725,6 +737,69 @@ class AppViewModel(private val platform: Platform) : ViewModel() {
         ownMotion.sent(nowMs())
         planMove(axis, value, relative).lines.forEach { link.sendLine(it) }
     }
+    // ---- bed map ("Go to") --------------------------------------------------------------------
+    /** The map's grid (5 × 5 / 9 × 9 / 17 × 17), remembered. */
+    val mapGrid = MutableStateFlow(com.z1pendant.map.MapGrid.entries.firstOrNull { it.name == prefs.getString("map.grid", null) }
+        ?: com.z1pendant.map.MapGrid.G9)
+    fun setMapGrid(g: com.z1pendant.map.MapGrid) { mapGrid.value = g; prefs.edit { putString("map.grid", g.name) } }
+    /** The move the map started (null = none); the map shows its steps and Stop. */
+    val mapMove = MutableStateFlow<com.z1pendant.map.MapMove?>(null)
+    private var mapJob: Job? = null
+
+    /** Why the map can't move now (null = it can). */
+    fun mapBlocked(): String? {
+        val st = link.status.value
+        return when {
+            link.conn.value != ConnState.Connected -> "Not connected."
+            st == null || !st.isIdle -> "The machine is ${st?.state ?: "not reporting"}: it moves when it's Idle."
+            runner.running.value != null -> "“${runner.running.value!!.label}” is still running."
+            mapMove.value?.let { it.stage != com.z1pendant.map.MapMove.Stage.DONE && it.error == null } == true -> "Still moving."
+            else -> null
+        }
+    }
+
+    /**
+     * Move to [t]: with [safeZ], Z all the way up, then X/Y; without, X/Y at the current height
+     * (machine coordinates). The steps follow the reported position: Lift until Z is up, Move until
+     * it's Idle at the target.
+     */
+    fun mapGo(t: com.z1pendant.map.MapTarget, safeZ: Boolean = true) {
+        mapBlocked()?.let { snack.tryEmit("Go to: $it"); haptics.thud(); return }
+        haptics.press()
+        log("▶ map: go to ${t.label} (machine X ${Fmt.fixed(t.x, 3)} Y ${Fmt.fixed(t.y, 3)}, ${if (safeZ) "Z up first" else "Z stays"})")
+        ownMotion.sent(nowMs())
+        com.z1pendant.map.BedMap.moveLines(t, safeZ).forEach { link.sendLine(it) }
+        val safe = com.z1pendant.map.BedMap.SAFE_Z
+        mapMove.value = com.z1pendant.map.MapMove(t, if (safeZ) com.z1pendant.map.MapMove.Stage.LIFT else com.z1pendant.map.MapMove.Stage.MOVE, safeZ = safeZ)
+        mapJob?.cancel()
+        mapJob = viewModelScope.launch {
+            val t0 = nowMs(); var moved = false
+            while (true) {
+                kotlinx.coroutines.delay(60)
+                val st = link.status.value ?: continue
+                val cur = mapMove.value ?: return@launch
+                if (link.conn.value != ConnState.Connected) { mapMove.value = cur.copy(error = "The link to the machine dropped."); return@launch }
+                if (st.isAlarm) { mapMove.value = cur.copy(error = "The machine stopped (Alarm)."); return@launch }
+                if (!st.isIdle) moved = true
+                if (cur.stage == com.z1pendant.map.MapMove.Stage.LIFT && kotlin.math.abs(st.mpos[2] - safe) < 0.01)
+                    mapMove.value = cur.copy(stage = com.z1pendant.map.MapMove.Stage.MOVE)
+                val there = kotlin.math.abs(st.mpos[0] - t.x) < 0.01 && kotlin.math.abs(st.mpos[1] - t.y) < 0.01
+                if (st.isIdle && there && link.pendingLines == 0) {
+                    mapMove.value = cur.copy(stage = com.z1pendant.map.MapMove.Stage.DONE); haptics.press(); return@launch
+                }
+                // Idle somewhere else after it moved (or never moving): the machine didn't take it.
+                if (st.isIdle && link.pendingLines == 0 && (moved || nowMs() - t0 > 4000) && !there && nowMs() - t0 > 1500) {
+                    mapMove.value = cur.copy(error = "It stopped short of ${t.label}."); return@launch
+                }
+            }
+        }
+    }
+
+    /** Stop on the map: halt at once (reset, like probing's Stop). Unlock afterwards. */
+    fun mapStop() { mapJob?.cancel(); mapMove.value = mapMove.value?.copy(error = "Stopped."); haptics.press(); link.reset() }
+    /** The map closed, or a new target was picked: forget the last move. */
+    fun mapClear() { if (mapMove.value?.let { it.stage == com.z1pendant.map.MapMove.Stage.DONE || it.error != null } != false) mapMove.value = null }
+
     fun setFeedOverride(p: Int) = link.dialect.feedOverride(p.coerceIn(10, 300)).forEach { link.sendLine(it) }
     fun hold() { haptics.press(); link.feedHold() }
     fun resume() { haptics.press(); link.resume() }

@@ -157,6 +157,90 @@ class FilesSimTest {
         assertTrue(notes.toString(), notes.any { it.startsWith("Deleted 2") })
     }
 
+    @Test fun controllerMoveIntoAFolderAndBackUp() = runBlocking {
+        val notes = mutableListOf<String>()
+        File(sd, "a.cnc").writeText("G0\n"); File(sd, "b.cnc").writeText("G1\n"); File(sd, "c.cnc").writeText("G2\n")
+        File(sd, "jobs").mkdirs(); File(sd, "jobs/c.cnc").writeText("already there\n")
+        val files = FilesController(link, scope, MapPrefs()) { notes += it }
+        files.open()
+        waitFor { files.entries.value?.any { it.name == "jobs" } == true && files.readOnly.value == null }
+
+        // Not into the folder they're in, and a folder not into itself.
+        assertFalse(files.canDrop(listOf("a.cnc"), RemoteFiles.ROOT))
+        assertFalse(files.canDrop(listOf("jobs"), "/sd/gcodes/jobs"))
+        assertTrue(files.canDrop(listOf("a.cnc", "jobs"), "/sd/gcodes/Examples"))
+
+        // Three into jobs: c.cnc is taken there, so it stays put; the other two move.
+        files.move(listOf("a.cnc", "b.cnc", "c.cnc"), "/sd/gcodes/jobs")
+        waitFor { files.working.value == null && File(sd, "jobs/a.cnc").exists() }
+        assertTrue(File(sd, "jobs/b.cnc").exists())
+        assertFalse(File(sd, "a.cnc").exists()); assertFalse(File(sd, "b.cnc").exists())
+        assertEquals("G2\n", File(sd, "c.cnc").readText())
+        assertEquals("already there\n", File(sd, "jobs/c.cnc").readText())
+        assertTrue(notes.toString(), notes.last().startsWith("Moved 2 to jobs") && "c.cnc is already in jobs" in notes.last())
+
+        // Up again from inside the folder (dropping on the gcodes crumb).
+        files.enter("jobs")
+        waitFor { files.path.value == "/sd/gcodes/jobs" && files.entries.value?.any { it.name == "a.cnc" } == true }
+        files.move(listOf("a.cnc"), RemoteFiles.ROOT)
+        waitFor { files.working.value == null && File(sd, "a.cnc").exists() }
+        assertFalse(File(sd, "jobs/a.cnc").exists())
+        assertEquals("Moved a.cnc to gcodes", notes.last())
+
+        // A whole folder into another one.
+        files.goTo(RemoteFiles.ROOT)
+        waitFor { files.path.value == RemoteFiles.ROOT && files.entries.value?.any { it.name == "jobs" } == true }
+        files.move(listOf("jobs"), "/sd/gcodes/Examples")
+        waitFor { files.working.value == null && File(sd, "Examples/jobs/b.cnc").exists() }
+        assertFalse(File(sd, "jobs").exists())
+    }
+
+    /** The Z1 mangles file command lines over 128 bytes (2026-11-23): Jimmy's move came to 134. */
+    @Test fun longNamesMoveRenameAndDeleteThroughAShortName() = runBlocking {
+        val notes = mutableListOf<String>()
+        val long = "stock_nut_STEEL_S2bflipchamfer_(re-probed).cnc"
+        File(sd, long).writeText("G2\n")
+        File(sd, "stock_nut_steel").mkdirs()
+        // The link itself refuses an over-long line, whatever the command.
+        val err = link.delete("/sd/gcodes/" + "x".repeat(130))
+        assertTrue(err.toString(), err!!.contains("too long"))
+
+        val files = FilesController(link, scope, MapPrefs()) { notes += it }
+        files.open()
+        waitFor { files.entries.value?.any { it.name == long } == true && files.readOnly.value == null }
+        assertTrue("mv /sd/gcodes/$long /sd/gcodes/stock_nut_steel/$long".length > 128)
+
+        files.move(listOf(long), "/sd/gcodes/stock_nut_steel")
+        waitFor { files.working.value == null && File(sd, "stock_nut_steel/$long").exists() }
+        assertFalse(File(sd, long).exists())
+        assertEquals("G2\n", File(sd, "stock_nut_steel/$long").readText())
+        assertTrue(notes.toString(), notes.last().startsWith("Moved"))
+        assertTrue(sd.walk().none { it.name.startsWith("_mv") })            // no short name left behind
+
+        files.enter("stock_nut_steel")
+        waitFor { files.path.value == "/sd/gcodes/stock_nut_steel" && files.entries.value?.any { it.name == long } == true }
+        val e = files.entries.value!!.first { it.name == long }
+        val longer = "stock_nut_STEEL_S2bflipchamfer_(re-probed)_again.cnc"
+        files.rename(e, longer)
+        waitFor { files.working.value == null && File(sd, "stock_nut_steel/$longer").exists() }
+        assertFalse(File(sd, "stock_nut_steel/$long").exists())
+
+        val deep = "a_folder_name_long_enough_to_push_rm_over_the_limit"
+        File(sd, "stock_nut_steel/$deep").mkdirs()
+        val name = "a_very_long_file_name_that_takes_rm_past_128_bytes.cnc"
+        File(sd, "stock_nut_steel/$deep/$name").writeText("G0\n")
+        files.enter(deep)
+        waitFor { files.entries.value?.any { it.name == name } == true }
+        assertTrue("rm ${files.path.value}/$name".length > 128)
+        // Too long for rm, and renaming it first would be longer still: refused, with the reason, file kept.
+        val before = notes.size
+        files.delete(listOf(name))
+        waitFor { notes.size > before && files.working.value == null }
+        assertTrue(notes.toString(), notes.last().startsWith("Couldn't delete") && "too long" in notes.last())
+        assertTrue(File(sd, "stock_nut_steel/$deep/$name").exists())
+        assertTrue(sd.walk().none { it.name.startsWith("_mv") })
+    }
+
     @Test fun controllerCancelMidTransferLeavesNothing() = runBlocking {
         val notes = mutableListOf<String>()
         val files = FilesController(link, scope, MapPrefs()) { notes += it }

@@ -178,10 +178,15 @@ class MakeraLink(
 
     private fun wirePath(path: String) = path.replace(' ', '\u0001')
 
+    /** Lines of 129+ bytes get mixed with an earlier command's leftovers (reference/file_commands_notes.md). */
+    override val fsLineMax: Int get() = 128
+
     /** Send [line]; returns (ok, final text) or null on no answer. Listing chunks go to [listing]. */
     private suspend fun fsCommand(line: String, timeoutMs: Long = 8000, listing: StringBuilder? = null): Pair<Boolean, String>? =
         fsLock.withLock {
             if (conn.value != ConnState.Connected) return null
+            // Never send a line the board would mangle: an over-long rm could delete something else.
+            if (line.encodeToByteArray().size > fsLineMax) return false to "the path is too long for the Z1 (over $fsLineMax characters)"
             val done = kotlinx.coroutines.CompletableDeferred<Pair<Boolean, String>>()
             fsSink = { type, payload ->
                 when (type) {
@@ -535,7 +540,15 @@ class MakeraLink(
     }
 
     override fun feedHold() { rt('!'.code); sent.tryEmit("! (feed hold)") }
-    override fun resume() { rt('~'.code); sent.tryEmit("~ (resume)") }
+    /**
+     * `~` only ends a feed hold ("Hold"). A file's M600 suspends the job ("Pause"), and the firmware
+     * ignores `~` then: only the `resume` command (or M601) ends it, moving back to the saved XYZ and
+     * restoring the spindle. Confirmed on the Z1 2026-11-24.
+     */
+    override fun resume() {
+        if (status.value?.state.equals("Pause", true)) sendLine("resume")
+        else { rt('~'.code); sent.tryEmit("~ (resume)") }
+    }
     override fun reset() {
         synchronized(lock) { queue.clear() }
         rt(0x18); sent.tryEmit("Ctrl-X (reset)")

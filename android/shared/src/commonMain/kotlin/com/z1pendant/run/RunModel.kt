@@ -99,6 +99,7 @@ data class CamOffset(val x: Double, val y: Double) {
 enum class Origin(val label: String, val sub: String) {
     CURRENT("Current origin", "Keep the work zero that's set now"),
     ANCHOR1("Anchor 1", "X/Y zero at the bracket's inside corner, plus an offset"),
+    CUSTOM("Custom anchor", "One of your saved anchors (Settings › Anchors)"),
     SPINDLE("Where the spindle is", "X/Y zero right here"),
     PROBE3D("Custom · 3D probe", "Next opens the probe; set the zero to go on"),
 }
@@ -109,6 +110,12 @@ data class RunSetup(
     /** Anchor 1: the work zero's offset from the anchor. */
     val offX: Double = 0.0,
     val offY: Double = 0.0,
+    /** Custom anchor: the one picked, and the work zero's offset from it (machine X/Y, mm). */
+    val anchor: Anchor? = null,
+    val aOffX: Double = 0.0,
+    val aOffY: Double = 0.0,
+    /** Custom anchor with a saved Z: set Z from it (no Z probe needed). */
+    val useAnchorZ: Boolean = true,
     val probeZ: Boolean = false,
     /** Where Z is probed, from the toolpath's min corner (null = the middle of the toolpath). */
     val zAtX: Double? = null,
@@ -124,13 +131,18 @@ data class RunSetup(
     /** Leveling: the deepest a touch may go below the stock top (Settings; 2 mm, Jimmy 2026-11-19). */
     val levelBelow: Double = LEVEL_BELOW_MM,
 ) {
-    /** Anchor 1 sets X/Y only, so Z must be probed. */
-    val probeZLocked get() = origin == Origin.ANCHOR1
+    /** The custom anchor sets Z too (it has one and it's wanted). */
+    val anchorSetsZ get() = origin == Origin.CUSTOM && anchor?.z != null && useAnchorZ
+    /** Anchor 1 (and a custom anchor without Z) sets X/Y only, so Z must be probed. */
+    val probeZLocked get() = origin == Origin.ANCHOR1 || (origin == Origin.CUSTOM && !anchorSetsZ)
     val zOn get() = probeZ || probeZLocked
     /** Any of these runs with the laser probe (T0) in the spindle. */
     val needsLaser get() = zOn || marginAtStart || leveling
 
     fun withOrigin(o: Origin) = copy(origin = o, probeZ = o == Origin.ANCHOR1 || o == Origin.SPINDLE)
+
+    /** Pick [a] as the custom anchor (offsets back to 0; its saved Z is used if it has one). */
+    fun withAnchor(a: Anchor?) = copy(origin = Origin.CUSTOM, anchor = a, aOffX = 0.0, aOffY = 0.0, useAnchorZ = true, probeZ = false)
 
     /** Z probe point relative to the toolpath's min corner. */
     fun zPoint(e: Extents): Pair<Double, Double> = (zAtX ?: (e.width / 2)) to (zAtY ?: (e.height / 2))
@@ -194,6 +206,14 @@ object RunCommands {
     fun originLines(s: RunSetup, anchor: Pair<Double, Double>?): List<String> = when (s.origin) {
         // G10 L2 = the work offset itself, in machine coordinates (Studio: "G10L2P0X%1Y%2").
         Origin.ANCHOR1 -> anchor?.let { (ax, ay) -> listOf("G10L2P0X${n(ax + s.offX)}Y${n(ay + s.offY)}") } ?: emptyList()
+        Origin.CUSTOM -> s.anchor?.let { a ->
+            val w = buildString {
+                a.x?.let { append("X").append(n(it + s.aOffX)) }
+                a.y?.let { append("Y").append(n(it + s.aOffY)) }
+                if (s.anchorSetsZ) append("Z").append(n(a.z!!))
+            }
+            if (w.isEmpty()) emptyList() else listOf("G10L2P0$w")
+        } ?: emptyList()
         Origin.SPINDLE -> listOf("G10L20P0X0Y0")
         else -> emptyList()
     }

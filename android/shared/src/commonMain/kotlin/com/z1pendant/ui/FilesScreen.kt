@@ -3,7 +3,10 @@ package com.z1pendant.ui
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -13,14 +16,17 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -55,19 +61,36 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.onLongClick
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.z1pendant.AppViewModel
@@ -87,6 +110,11 @@ private val Danger = Color(0xFFF87171)
 private val Playing = Color(0xFF86EFAC)
 private val WarnBg = Color(0xFF3A2A0B)
 private val WarnText = Color(0xFFFDE68A)
+private val DropBg = Color(0xFF14532D)
+private val DropEdge = Color(0xFF4ADE80)
+
+/** A hold-and-drag in progress: what's being moved, where the finger is (root coordinates), and whether it has moved yet. */
+private data class Drag(val names: List<String>, val at: Offset, val start: Offset, val moved: Boolean = false)
 
 /**
  * Files on the Z1's SD card (/sd/gcodes and its folders): Job info, rename, delete, new folder, upload from
@@ -127,9 +155,42 @@ fun FilesScreen(vm: AppViewModel, pickForRun: Boolean = false, onRun: (String) -
     /** Where an upload lands: "SD card › gcodes › jobs". */
     val into = "SD card › " + RemoteFiles.crumbs(path).joinToString(" › ") { it.first }
 
+    // ---- hold and drag onto a folder (a row or a crumb) to move ----
+    /** Rows on screen by name, and folders you can drop on by full path, in root coordinates. */
+    val rowBounds = remember { mutableStateMapOf<String, Rect>() }
+    val folderBounds = remember { mutableStateMapOf<String, Rect>() }
+    var drag by remember { mutableStateOf<Drag?>(null) }
+    var listCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    var screenOrigin by remember { mutableStateOf(Offset.Zero) }
+    val listState = rememberLazyListState()
+    val haptics = LocalHapticFeedback.current
+    val density = LocalDensity.current
+    /** The folder under the finger that the dragged items can go into. */
+    val dropOn = drag?.takeIf { it.moved }?.let { d ->
+        folderBounds.entries.firstOrNull { (p, r) -> r.contains(d.at) && f.canDrop(d.names, p) }?.key
+    }
+    // Near the top or bottom of the list while dragging: scroll it, so a folder further up or down can be reached.
+    LaunchedEffect(drag != null) {
+        val edge = with(density) { 56.dp.toPx() }
+        while (drag != null) {
+            val d = drag; val box = listCoords?.boundsInRoot()
+            if (d != null && d.moved && box != null) {
+                val by = when {
+                    d.at.y < box.top + edge -> -(box.top + edge - d.at.y) / 3
+                    d.at.y > box.bottom - edge -> (d.at.y - (box.bottom - edge)) / 3
+                    else -> 0f
+                }
+                if (by != 0f) listState.scrollBy(by)
+            }
+            kotlinx.coroutines.delay(16)
+        }
+    }
+    LaunchedEffect(path) { rowBounds.clear(); folderBounds.clear(); drag = null }
+
     LaunchedEffect(Unit) { f.open() }
     PlatformBackHandler { if (!f.back()) onClose() }
 
+    Box(Modifier.fillMaxSize().onGloballyPositioned { screenOrigin = it.positionInRoot() }) {
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(Modifier.windowInsetsPadding(WindowInsets.safeDrawing).padding(horizontal = 12.dp, vertical = 8.dp)) {
             // ---- header: title bar, or "N selected" while selecting ----
@@ -159,9 +220,20 @@ fun FilesScreen(vm: AppViewModel, pickForRun: Boolean = false, onRun: (String) -
                 crumbs.forEachIndexed { i, (label, p) ->
                     Text("  ›  ", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
                     val last = i == crumbs.lastIndex
+                    // While dragging, the folders above this one are drop targets too (the way to move something up).
+                    val target = drag?.moved == true && !last && f.canDrop(drag!!.names, p)
                     Text(label, fontSize = 13.sp,
                         color = if (last) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary,
-                        modifier = if (last) Modifier else Modifier.clickable { f.goTo(p) })
+                        modifier = (if (last) Modifier else Modifier
+                            .onGloballyPositioned { folderBounds[p] = it.boundsInRoot().inflate(with(density) { 8.dp.toPx() }) }
+                            .clickable { f.goTo(p) })
+                            .clip(RoundedCornerShape(6.dp))
+                            .then(when {
+                                dropOn == p -> Modifier.background(DropBg).border(1.dp, DropEdge, RoundedCornerShape(6.dp))
+                                target -> Modifier.border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f), RoundedCornerShape(6.dp))
+                                else -> Modifier
+                            })
+                            .padding(horizontal = 4.dp, vertical = 2.dp))
                 }
             }
 
@@ -196,11 +268,64 @@ fun FilesScreen(vm: AppViewModel, pickForRun: Boolean = false, onRun: (String) -
                     entries == null && loadError != null -> Message(loadError!!)
                     entries == null -> Message("Reading the SD card…")
                     entries.isEmpty() -> Message(if (path == RemoteFiles.ROOT) "No files yet." else "This folder is empty.")
-                    else -> LazyColumn(Modifier.fillMaxSize()) {
+                    else -> LazyColumn(Modifier.fillMaxSize()
+                        .onGloballyPositioned { listCoords = it }
+                        // Hold a row: it's selected (as before). Keep holding and drag: the selection follows the
+                        // finger and drops into the folder it's let go over. Watched on the Initial pass so that,
+                        // once the hold has fired, the list doesn't scroll and the row doesn't also take a tap.
+                        .pointerInput(Unit) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                val lc = listCoords ?: return@awaitEachGesture
+                                val at0 = lc.localToRoot(down.position)
+                                val name = rowBounds.entries.firstOrNull { it.value.contains(at0) }?.key ?: return@awaitEachGesture
+                                val endedEarly = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                                    while (true) {
+                                        val c = awaitPointerEvent(PointerEventPass.Initial).changes.firstOrNull { it.id == down.id }
+                                        if (c == null || !c.pressed || c.isConsumed ||
+                                            (c.position - down.position).getDistance() > viewConfiguration.touchSlop) break
+                                    }
+                                    true
+                                }
+                                if (endedEarly != null) return@awaitEachGesture
+                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                f.select(name)
+                                val canMove = readOnly == null
+                                drag = Drag(emptyList(), at0, at0)
+                                val slop = viewConfiguration.touchSlop
+                                while (true) {
+                                    val c = awaitPointerEvent(PointerEventPass.Initial).changes.firstOrNull { it.id == down.id } ?: break
+                                    c.consume()
+                                    if (!c.pressed) break
+                                    val d = drag ?: break
+                                    val at = lc.localToRoot(c.position)
+                                    drag = when {
+                                        d.moved -> d.copy(at = at)
+                                        canMove && (at - d.start).getDistance() > slop ->
+                                            d.copy(at = at, moved = true, names = (f.selected.value + name).toList())
+                                        else -> d.copy(at = at)
+                                    }
+                                }
+                                val d = drag
+                                val target = d?.takeIf { it.moved }?.let { dd ->
+                                    folderBounds.entries.firstOrNull { (p, r) -> r.contains(dd.at) && f.canDrop(dd.names, p) }?.key
+                                }
+                                drag = null
+                                if (d != null && target != null) f.move(d.names, target)
+                            }
+                        }, state = listState) {
                         items(entries, key = { it.name }) { e ->
                             val full = RemoteFiles.child(path, e.name)
+                            DisposableEffect(full) { onDispose { rowBounds.remove(e.name); folderBounds.remove(full) } }
                             EntryRow(e, isSelected = e.name in selected, selecting = selecting,
                                 isPlaying = playing == full, isFresh = e.name in fresh,
+                                lifted = drag?.moved == true && e.name in drag!!.names,
+                                dropHere = dropOn == full,
+                                modifier = Modifier.onGloballyPositioned { c ->
+                                    val r = c.boundsInRoot()
+                                    rowBounds[e.name] = r
+                                    if (e.isDir) folderBounds[full] = r
+                                },
                                 onClick = {
                                     when {
                                         selecting -> f.toggleSelected(e.name)
@@ -218,9 +343,34 @@ fun FilesScreen(vm: AppViewModel, pickForRun: Boolean = false, onRun: (String) -
             // ---- footer ----
             val files = entries.orEmpty().filter { !it.isDir }
             Text(working ?: "${files.size} file${if (files.size == 1) "" else "s"} · ${RemoteFiles.sizeLabel(files.sumOf { it.size })}" +
-                    if (selecting) "" else if (pickForRun) "   ·   " + (runBlock ?: "tap a file to set it up") else "   ·   tap a file, hold to select",
+                    when {
+                        selecting -> if (readOnly == null) "   ·   hold and drag onto a folder to move" else ""
+                        pickForRun -> "   ·   " + (runBlock ?: "tap a file to set it up")
+                        else -> "   ·   tap a file, hold to select or drag"
+                    },
                 fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp, start = 4.dp))
         }
+    }
+
+    // ---- what's being dragged, just above and right of the finger so the finger doesn't hide it ----
+    drag?.takeIf { it.moved }?.let { d ->
+        val one = d.names.singleOrNull()
+        val isDir = one != null && entries.orEmpty().any { it.name == one && it.isDir }
+        val to = dropOn?.let { RemoteFiles.crumbs(it).last().first }
+        Row(Modifier
+            .offset { IntOffset((d.at.x - screenOrigin.x + 20.dp.toPx()).toInt(), (d.at.y - screenOrigin.y - 64.dp.toPx()).toInt()) }
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (to != null) DropBg else Color(0xFF1E293B))
+            .border(1.dp, if (to != null) DropEdge else MaterialTheme.colorScheme.primary, RoundedCornerShape(10.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Icon(if (isDir) Icons.Filled.Folder else Icons.Outlined.Description, null, modifier = Modifier.size(18.dp),
+                tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(6.dp))
+            Text((one ?: "${d.names.size} items") + (to?.let { "  →  $it" } ?: ""), fontSize = 14.sp, fontWeight = FontWeight.Medium,
+                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 260.dp))
+        }
+    }
     }
 
     // ---- the file's sheet ----
@@ -373,11 +523,15 @@ private fun Message(text: String) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun EntryRow(e: RemoteEntry, isSelected: Boolean, selecting: Boolean, isPlaying: Boolean, isFresh: Boolean,
+                     lifted: Boolean, dropHere: Boolean, modifier: Modifier,
                      onClick: () -> Unit, onLongClick: () -> Unit) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
-        .background(if (isSelected || isPlaying) Color(0xFF0E2A3D) else Color.Transparent)
-        .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+    // The hold itself is watched by the list (it starts a drag); here it's only offered to accessibility services.
+    Row(modifier.fillMaxWidth().alpha(if (lifted) 0.4f else 1f).clip(RoundedCornerShape(8.dp))
+        .background(when { dropHere -> DropBg; isSelected || isPlaying -> Color(0xFF0E2A3D); else -> Color.Transparent })
+        .then(if (dropHere) Modifier.border(1.5.dp, DropEdge, RoundedCornerShape(8.dp)) else Modifier)
+        .clickable(onClick = onClick)
+        .semantics { onLongClick("Select") { onLongClick(); true } }
         .padding(horizontal = 8.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically) {
         when {

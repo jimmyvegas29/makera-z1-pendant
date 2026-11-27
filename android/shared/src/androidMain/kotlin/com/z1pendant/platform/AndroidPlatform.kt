@@ -16,6 +16,7 @@ class AndroidPlatform(ctx: Context) : Platform {
     override val prefs: Prefs = SharedPrefs(app.getSharedPreferences("z1pendant", Context.MODE_PRIVATE))
     override val hotkeyFile: TextFile = FileText(File(app.filesDir, "hotkeys.json"))
     override val haptics: Haptics = AndroidHaptics(app)
+    override val updater: com.z1pendant.update.Updater = com.z1pendant.update.AndroidUpdater(app)
 
     /** Some phones drop broadcast packets unless a multicast lock is held. */
     override fun holdDiscoveryLock(): () -> Unit {

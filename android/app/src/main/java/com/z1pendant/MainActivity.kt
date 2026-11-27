@@ -68,6 +68,8 @@ class MainActivity : ComponentActivity() {
             val n = i.getIntExtra("testclicks", 0); val ms = i.getIntExtra("testms", 1000).toLong()
             vm.viewModelScopeLaunchBurst(n, ms)
         }
+        // Test hook: `--es updateurl http://<pc>:8000/latest.json` = update check against a stand-in release.
+        i.getStringExtra("updateurl")?.let { vm.updates.testCheck(it) }
         val host = i.getStringExtra("host") ?: return
         vm.connect(com.z1pendant.link.MachineTarget(i.getStringExtra("name") ?: host, host, i.getIntExtra("port", 2222)))
     }

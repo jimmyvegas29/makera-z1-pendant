@@ -31,6 +31,7 @@ interface MachineLink {
     val pendingLines: Int
 
     fun feedHold()
+    /** Carry on after a feed hold, or after a pause the file asked for (M600 on the Z1). */
     fun resume()
     /** Abort: stop motion now, flush queues. Machine needs unlock afterwards. */
     fun reset()
@@ -57,6 +58,12 @@ interface MachineLink {
     // ---- files on the machine's SD card (answered by the Wi-Fi board; nothing moves) ----
     /** A folder's entries, or null if it couldn't be read. A missing folder reads as empty on the Z1. */
     suspend fun listDir(path: String): List<RemoteEntry>? = null
+    /**
+     * The longest file command line (`mv <from> <to>`, `rm <path>`, …) the machine takes, in bytes. The Z1's
+     * Wi-Fi board breaks on longer ones: it acts on leftovers of an earlier command instead (measured
+     * 2026-11-23: 128 works, 129 doesn't). The link refuses longer lines; FilesController works round it.
+     */
+    val fsLineMax: Int get() = Int.MAX_VALUE
     /** The rest return null when done, or the reason it failed. */
     suspend fun makeDir(path: String): String? = "not supported"
     suspend fun rename(from: String, to: String): String? = "not supported"

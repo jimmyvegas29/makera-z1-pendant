@@ -13,7 +13,7 @@ import kotlin.math.abs
  * each touch back from the machine's `[PRB:x,y,z:1]` report.
  */
 enum class ProbeKind(val label: String) {
-    OUTSIDE("Outside corner"), INSIDE("Inside corner"), HOLE("Hole center"), BLOCK("Block center"), TOP("Top only");
+    OUTSIDE("Outside corner"), INSIDE("Inside corner"), HOLE("Hole center"), BLOCK("Block center"), TOP("Top only"), EDGE("Edge");
     val hasCorner get() = this == OUTSIDE || this == INSIDE
     val hasCenterAxes get() = this == HOLE || this == BLOCK
     /** Can touch Z (the top surface). A hole starts inside the hole, so it has no Z. */
@@ -25,6 +25,16 @@ enum class Corner(val label: String) {
     BACK_LEFT("back-left"), BACK_RIGHT("back-right"), FRONT_LEFT("front-left"), FRONT_RIGHT("front-right");
     val left get() = this == BACK_LEFT || this == FRONT_LEFT
     val back get() = this == BACK_LEFT || this == BACK_RIGHT
+}
+
+/**
+ * One side of the part, seen from above (front = toward you, machine −Y). [axis] = the axis the probe
+ * moves along to touch it; [dir] = which way it moves (+1 / −1) coming in from outside the part.
+ */
+enum class Side(val label: String, val axis: Char, val dir: Int) {
+    BACK("back", 'Y', -1), FRONT("front", 'Y', 1), LEFT("left", 'X', 1), RIGHT("right", 'X', -1);
+    /** The axis along the edge (where a second touch moves). */
+    val along get() = if (axis == 'X') 'Y' else 'X'
 }
 
 /** [noun] = the name inside a sentence ("Load the 3D probe", "the laser probe"). */
@@ -95,13 +105,39 @@ data class ProbeSetup(
     val depth: Double = 2.0,
     /** Ball (tip) diameter. */
     val tip: Double = 2.0,
+    /** Edge: which side of the part. */
+    val edge: Side = Side.FRONT,
+    /**
+     * Edge: "Start from here". The ball is already beside the part at touching height: no top touch,
+     * no Z move; it goes straight in to the edge (and [x] / [y] is how far it searches). Off = "Touch
+     * the top first": it starts over the part, touches the top, then out, down and back in.
+     */
+    val edgeFromHere: Boolean = false,
+    /** Edge: several touches along it, measure only (how straight and how square it is). Off = 1 touch. */
+    val edgeMulti: Boolean = false,
+    /** Edge, multiple points: how many touches (2–8). */
+    val edgeCount: Int = 2,
+    /** Edge, multiple points: from the first touch to the last, mm. */
+    val edgeLength: Double = 10.0,
+    /** Edge, multiple points: +1 = toward + on the along axis (right, or back), −1 the other way. */
+    val alongSign: Int = 1,
 ) {
     /** Pick a probe; the laser probe can only do Top only. */
     fun withTool(t: ProbeTool) = copy(tool = t, kind = if (t.topOnly) ProbeKind.TOP else kind).normalized()
 
-    val doX get() = kind != ProbeKind.TOP && axisX
-    val doY get() = kind != ProbeKind.TOP && axisY
-    val doZ get() = kind == ProbeKind.TOP || (kind.hasTop && axisZ)
+    val doX get() = when (kind) { ProbeKind.TOP -> false; ProbeKind.EDGE -> edge.axis == 'X'; else -> axisX }
+    val doY get() = when (kind) { ProbeKind.TOP -> false; ProbeKind.EDGE -> edge.axis == 'Y'; else -> axisY }
+    val doZ get() = when (kind) { ProbeKind.TOP -> true; ProbeKind.EDGE -> !edgeFromHere; else -> kind.hasTop && axisZ }
+    /** Edge, several touches along it (always measure only). */
+    val multi get() = kind == ProbeKind.EDGE && edgeMulti
+    /** Edge, starting beside the part at touching height. */
+    val fromHere get() = kind == ProbeKind.EDGE && edgeFromHere
+    /** Edge: how many touches. */
+    val touchCount get() = if (multi) edgeCount.coerceIn(MIN_POINTS, MAX_POINTS) else 1
+    /** Edge, multiple points: from one touch to the next. */
+    val spacing get() = if (touchCount > 1) edgeLength / (touchCount - 1) else 0.0
+    /** Edge: where each touch is along the edge, from where the probe was parked (the first is 0). */
+    fun alongOffsets(): List<Double> = (0 until touchCount).map { alongSign * it * spacing }
     /** Touches the sides (not just the top). */
     val doSides get() = doX || doY
     /** At least one axis to probe. */
@@ -117,7 +153,7 @@ data class ProbeSetup(
      * Z off but touching sides: no top touch to measure the side depth from, so the work Z0 stands in
      * for the top (set it first, e.g. with Top only).
      */
-    val depthFromZero get() = !doZ && doSides && kind != ProbeKind.HOLE
+    val depthFromZero get() = !doZ && doSides && kind != ProbeKind.HOLE && kind != ProbeKind.EDGE
 
     /**
      * Why it can't start from work Z [wposZ] (null = fine). With Z off it moves out over the part at
@@ -132,9 +168,35 @@ data class ProbeSetup(
     fun axesText() = listOfNotNull("X".takeIf { doX }, "Y".takeIf { doY }, "Z".takeIf { doZ }).joinToString(" ")
 
     fun title(): String {
+        if (kind == ProbeKind.EDGE) return "Edge · ${edge.label}" + if (multi) " · $touchCount points" else ""
         val all = doX && doY && (doZ || !kind.hasTop)
         val ax = if (kind != ProbeKind.TOP && !all) " · ${axesText()}" else ""
         return if (kind.hasCorner) "${kind.label} · ${corner.label}$ax" else kind.label + ax
+    }
+
+    /** Edge, multiple points: the way the touches go, as you'd say it ("right", "back"). */
+    fun alongWord(sign: Int = alongSign) = if (edge.along == 'X') (if (sign > 0) "right" else "left") else (if (sign > 0) "back" else "front")
+
+    /**
+     * Edge: which touches would leave the machine's travel ([limits], machine coordinates) from the
+     * probe parked at [start], and why (null = all fine). Checks where each touch is along the edge
+     * and, touching the top first, where it steps out past the edge. Soft limits off: nothing to check.
+     */
+    fun travelCheck(start: Touch?, limits: com.z1pendant.link.SoftLimits?): TravelCheck {
+        if (kind != ProbeKind.EDGE || start == null || limits == null || !limits.enabled) return TravelCheck(emptySet(), null)
+        fun inside(axis: Char, v: Double) = (limits.min[axis]?.let { v >= it - 1e-6 } ?: true) && (limits.max[axis]?.let { v <= it + 1e-6 } ?: true)
+        val ax = edge.axis; val al = edge.along
+        val off = if (ax == 'X') x else y
+        if (!fromHere && !inside(ax, start.on(ax) - edge.dir * off))
+            return TravelCheck((0 until touchCount).toSet(), "The $ax start offset would take it past the $ax travel: make it smaller.")
+        val bad = alongOffsets().withIndex().filter { (_, o) -> !inside(al, start.on(al) + o) }.map { it.index }.toSet()
+        if (bad.isEmpty()) return TravelCheck(bad, null)
+        return TravelCheck(bad, "Touch ${bad.min() + 1} would be past the $al travel: shorten the length or start further ${alongWord(-alongSign)}.")
+    }
+
+    companion object {
+        const val MIN_POINTS = 2
+        const val MAX_POINTS = 8
     }
 
     /**
@@ -149,7 +211,7 @@ data class ProbeSetup(
             ProbeKind.INSIDE -> (cornerIndex() + 4).takeIf { doX && doY && doZ }
             ProbeKind.HOLE -> 9.takeIf { doSides }
             ProbeKind.BLOCK -> 10.takeIf { doZ && doSides }
-            ProbeKind.TOP -> null
+            ProbeKind.TOP, ProbeKind.EDGE -> null
         } ?: return null
         val xv = if (doX) abs(x) else 0.0
         val yv = if (doY) abs(y) else 0.0
@@ -162,6 +224,11 @@ data class ProbeSetup(
     }
 }
 
+/** [bad] = the touches (0-based) that would leave the travel; [problem] = what to tell the user. */
+data class TravelCheck(val bad: Set<Int>, val problem: String?)
+
+internal fun Touch.on(axis: Char) = when (axis) { 'X' -> x; 'Y' -> y; else -> z }
+
 internal fun f3(v: Double) = Fmt.fixed(v, 3)
 
 /** The steps of a run, as the probing screen lists them. */
@@ -172,14 +239,24 @@ object Steps {
     const val X_WALLS = "Touch the X walls"; const val Y_WALLS = "Touch the Y walls"
     const val X_SIDES = "Touch the X sides"; const val Y_SIDES = "Touch the Y sides"
     const val CORNER = "Move over the corner"; const val EDGE = "Move over the edge"; const val CENTER = "Move to the center"
+    /** Edge started beside the part: it ends backed off the edge, at the same height. */
+    const val BACK_OFF = "Back off the edge"
+
+    /** Edge, multiple points: touch [i] (1-based) of [n]. */
+    fun touchOf(i: Int, n: Int) = "Touch $i of $n"
+    private val touchOf = Regex("""Touch \d+ of \d+""")
 
     /** Touches each step makes (fast + slow per side), to follow Makera's routine by its [PRB:] reports. */
-    fun touches(label: String) = when (label) {
-        TOP, X_SIDE, Y_SIDE, X_WALL, Y_WALL -> 2
-        X_WALLS, Y_WALLS, X_SIDES, Y_SIDES -> 4
+    fun touches(label: String) = when {
+        label == TOP || label == X_SIDE || label == Y_SIDE || label == X_WALL || label == Y_WALL || touchOf.matches(label) -> 2
+        label == X_WALLS || label == Y_WALLS || label == X_SIDES || label == Y_SIDES -> 4
         else -> 0
     }
 }
+
+/** Edge: the label of each touch (one side touch, or "Touch 1 of 5", …). */
+fun ProbeSetup.edgeTouchLabels(): List<String> =
+    if (multi) (1..touchCount).map { Steps.touchOf(it, touchCount) } else listOf(if (doX) Steps.X_SIDE else Steps.Y_SIDE)
 
 /** The steps this setup's run goes through, in order. */
 fun ProbeSetup.stepLabels(): List<String> = when (kind) {
@@ -188,11 +265,16 @@ fun ProbeSetup.stepLabels(): List<String> = when (kind) {
     ProbeKind.HOLE -> listOfNotNull(Steps.X_WALLS.takeIf { doX }, Steps.Y_WALLS.takeIf { doY }, finishLabel())
     ProbeKind.BLOCK -> listOfNotNull(Steps.TOP.takeIf { doZ }, Steps.X_SIDES.takeIf { doX }, Steps.Y_SIDES.takeIf { doY }, finishLabel())
     ProbeKind.TOP -> listOf(Steps.TOP)
+    ProbeKind.EDGE -> listOfNotNull(Steps.TOP.takeIf { doZ }) + edgeTouchLabels() + listOfNotNull(finishLabel())
 }
 
-/** The last step, moving over the point found: none when only the top was touched. */
+/**
+ * The last step, moving over the point found: none when only the top was touched. An edge started
+ * beside the part can't move over it (the ball is below the top): it backs off instead.
+ */
 fun ProbeSetup.finishLabel(): String? = when {
     !doSides -> null
+    fromHere -> Steps.BACK_OFF
     kind == ProbeKind.HOLE || kind == ProbeKind.BLOCK -> Steps.CENTER
     doX && doY -> Steps.CORNER
     else -> Steps.EDGE
@@ -231,10 +313,71 @@ data class Measured(
     val top: Double? = null,
     val centerX: Double? = null, val centerY: Double? = null,
     val widthX: Double? = null, val widthY: Double? = null,
+    /** Edge: every touch's edge position on the probed axis (machine), in order; the first is edgeX / edgeY. */
+    val edgeTouches: List<Double> = emptyList(),
+    /** Edge: where each touch was along the edge (machine, on the other axis). */
+    val edgeAlong: List<Double> = emptyList(),
 ) {
     /** The point that becomes (or would become) X0 / Y0. */
     val zeroX get() = centerX ?: edgeX
     val zeroY get() = centerY ?: edgeY
+}
+
+/**
+ * Several touches along one edge: a best-fit line through them (least squares), so how far the edge
+ * is turned from the machine's axis, and how far each touch is off that line (straightness).
+ * [t] = each touch's distance along the edge from the first (mm, ≥ 0 in the direction it went);
+ * [e] = each touch's edge position on the probed axis (machine). [outSign] = which way is out of the
+ * part on that axis, so a + offset means the touch sits further out than the line.
+ */
+data class EdgeFit(val t: List<Double>, val e: List<Double>, val outSign: Int) {
+    val n get() = t.size
+    private val tm = t.average()
+    private val em = e.average()
+    private val sxx = t.sumOf { (it - tm) * (it - tm) }
+    /** mm on the probed axis per mm along the edge. */
+    val slope: Double = if (sxx > 0) t.indices.sumOf { (t[it] - tm) * (e[it] - em) } / sxx else 0.0
+    /** From the first touch to the last. */
+    val length get() = (t.lastOrNull() ?: 0.0) - (t.firstOrNull() ?: 0.0)
+    /** How far the line moves on the probed axis from the first touch to the last (+ = toward + on that axis). */
+    val delta get() = slope * length
+    val degrees get() = kotlin.math.atan(slope) * 180.0 / kotlin.math.PI
+    /** mm per 100 mm along the edge: the number you'd tap a vise or part around by. */
+    val per100 get() = slope * 100.0
+    /** Each touch's distance from the line (+ = further out of the part than the line). */
+    val offLine: List<Double> = t.indices.map { (e[it] - (em + slope * (t[it] - tm))) * outSign }
+    /** Peak to valley of [offLine]; null with 2 touches (two points always sit on their line). */
+    val straightness: Double? get() = if (n >= 3) offLine.max() - offLine.min() else null
+    /** How fine the angle is, from the probe's [REPEAT] over these touches, in degrees. */
+    val noiseDegrees get() = noiseDegrees(t)
+
+    /** Straightness in words ("slightly hollow" …); null with 2 touches. */
+    fun shape(): String? {
+        val s = straightness ?: return null
+        if (s <= 2 * REPEAT) return "Straight to within the probe's repeat."
+        val r = offLine
+        val ends = (r.first() + r.last()) / 2
+        val middle = r.subList(1, r.size - 1).average()
+        val bit = if (s < 0.05) "slightly " else ""
+        return when {
+            ends - middle > s / 2 -> "The middle sits ${Fmt.fixed(-r.subList(1, r.size - 1).min(), 3)} mm in from the line and the ends stand out: the edge is ${bit}hollow."
+            middle - ends > s / 2 -> "The middle stands ${Fmt.fixed(r.subList(1, r.size - 1).max(), 3)} mm out from the line: the edge ${bit}bulges out."
+            else -> {
+                val i = r.indices.maxBy { abs(r[it]) }
+                "Touch ${i + 1} is furthest off the line (${Fmt.fixed(r[i], 3, plus = true)} mm): a burr, a chip or an uneven edge there."
+            }
+        }
+    }
+
+    companion object {
+        /** About how well the probe repeats (mm). */
+        const val REPEAT = 0.005
+        /** The angle [REPEAT] makes over touches at [t] along the edge (least-squares slope error), in degrees. */
+        fun noiseDegrees(t: List<Double>): Double {
+            val m = t.average(); val sxx = t.sumOf { (it - m) * (it - m) }
+            return if (sxx > 0) kotlin.math.atan(REPEAT / kotlin.math.sqrt(sxx)) * 180.0 / kotlin.math.PI else 0.0
+        }
+    }
 }
 
 /** Machine-side moves the sequences need; implemented over the link (and faked in tests). */
@@ -275,6 +418,7 @@ class ProbeSequences(private val io: ProbeIo, private val s: ProbeSetup, private
         s.kind == ProbeKind.OUTSIDE -> outsideCorner()
         s.kind == ProbeKind.INSIDE -> insideCorner()
         s.kind == ProbeKind.HOLE -> hole()
+        s.kind == ProbeKind.EDGE -> edge()
         else -> block()
     }
 
@@ -305,9 +449,9 @@ class ProbeSequences(private val io: ProbeIo, private val s: ProbeSetup, private
     }
 
     /** Down to touching height: [depth] below the top it touched, or with Z off below the work Z0. */
-    private suspend fun plunge(topZ: Double?) {
+    private suspend fun plunge(topZ: Double?, depth: Double = s.depth) {
         val ref = topZ ?: zeroZ ?: throw ProbeStop("Z is off and there's no Z0 to measure the side depth from.")
-        io.send("G53 G1 Z${f3(ref - s.depth)} F${f0(ProbeFeeds.PLUNGE)}")
+        io.send("G53 G1 Z${f3(ref - depth)} F${f0(ProbeFeeds.PLUNGE)}")
     }
 
     /** Over the point found, at the start height (an axis not probed stays put). */
@@ -369,6 +513,42 @@ class ProbeSequences(private val io: ProbeIo, private val s: ProbeSetup, private
         return Measured(edgeX = ex, edgeY = ey, top = topZ)
     }
 
+    /**
+     * Touching the top first: starts over the part, about 5 mm in from the edge: top, then out past
+     * the edge, down, and back in (like one side of an outside corner), and over the edge at the end.
+     * Started beside the part ([ProbeSetup.fromHere]): no top, no Z move; straight in to the edge, and
+     * back to where it started (never further than the search distance).
+     *
+     * Multiple points touch again further along the edge, each from the start line: touching the top
+     * first it goes back out to the full start offset and lifts before moving along (after a touch
+     * the ball is only 1 mm off the face, and over a long stretch a crooked part could be under it).
+     */
+    private suspend fun edge(): Measured {
+        val e = s.edge; val ax = e.axis; val dir = e.dir; val al = e.along
+        val off = if (ax == 'X') s.x else s.y
+        val labels = s.edgeTouchLabels()
+        val offsets = s.alongOffsets()
+        val found = mutableListOf<Double>(); val along = mutableListOf<Double>()
+        val topZ = topIfOn()
+        val out = if (s.fromHere) start.on(ax) else start.on(ax) - dir * off
+        offsets.forEachIndexed { i, o ->
+            io.step(labels[i])
+            val a = start.on(al) + o
+            if (!s.fromHere) io.send("G53 G0 $ax${f3(out)}")
+            if (i > 0) io.send("G53 G0 $al${f3(a)}")
+            if (!s.fromHere) plunge(topZ)
+            found += side(ax, dir, off) + dir * r; along += a
+            if (s.fromHere) io.send("G53 G0 $ax${f3(out)}") else io.send("G53 G0 Z${f3(start.z)}")
+        }
+        // Back along to where it was parked (the way it came), then over the edge or, started beside
+        // the part, stay backed off on the start line.
+        if (offsets.size > 1) io.send("G53 G0 $al${f3(start.on(al))}")
+        val e1 = found.first()
+        if (s.fromHere) io.step(Steps.BACK_OFF) else finish(if (ax == 'X') e1 else null, if (ax == 'Y') e1 else null)
+        return if (ax == 'X') Measured(edgeX = e1, top = topZ, edgeTouches = found, edgeAlong = along)
+            else Measured(edgeY = e1, top = topZ, edgeTouches = found, edgeAlong = along)
+    }
+
     /** Starts inside the hole at touching depth: out to both walls on each axis, then to the middle. */
     private suspend fun hole(): Measured {
         var cx: Double? = null; var cy: Double? = null; var wx: Double? = null; var wy: Double? = null
@@ -418,7 +598,6 @@ class ProbeSequences(private val io: ProbeIo, private val s: ProbeSetup, private
         return Measured(top = topZ, centerX = cx, centerY = cy, widthX = wx, widthY = wy)
     }
 
-    private fun Touch.on(axis: Char) = when (axis) { 'X' -> x; 'Y' -> y; else -> z }
     private fun f0(v: Double) = Fmt.fixed(v, 0)
 }
 

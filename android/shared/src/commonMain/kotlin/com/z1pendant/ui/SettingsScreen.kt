@@ -32,7 +32,7 @@ import com.z1pendant.platform.PlatformBackHandler
 import com.z1pendant.platform.rememberHotkeyFileActions
 
 @Composable
-fun SettingsScreen(vm: AppViewModel, onClose: () -> Unit) {
+fun SettingsScreen(vm: AppViewModel, onAnchors: () -> Unit = {}, onClose: () -> Unit) {
     val conn by vm.link.conn.collectAsState()
     val target by vm.target.collectAsState()
     val found by vm.discovered.collectAsState()
@@ -135,6 +135,16 @@ fun SettingsScreen(vm: AppViewModel, onClose: () -> Unit) {
                 Text(vm.haptics.description, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
                 Section("Run")
+                val anchorList by vm.anchors.list.collectAsState()
+                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceVariant)
+                    .clickable(onClick = onAnchors).padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Anchors", fontWeight = FontWeight.SemiBold)
+                        Text(if (anchorList.isEmpty()) "Save points like a vise jaw to use as a job's origin" else "${anchorList.size} saved for this Z1",
+                            fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Text("›", fontSize = 22.sp, color = MaterialTheme.colorScheme.primary)
+                }
                 // 0.5 to 10 mm in 0.5 mm steps.
                 LabeledSlider("Leveling: deepest touch below the stock top", levelBelow.toFloat(), 0.5f..10f,
                     "${com.z1pendant.util.Fmt.trimmed4(levelBelow)} mm", steps = 18) { vm.run.setLevelBelow(kotlin.math.round(it * 2) / 2.0) }
@@ -148,6 +158,9 @@ fun SettingsScreen(vm: AppViewModel, onClose: () -> Unit) {
                     TextButton(onClick = { confirmReset = true }) { Text("Reset to defaults") }
                 }
                 Text("Import replaces the whole set.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+                Section("App")
+                UpdatesSection(vm.updates)
                 Spacer(Modifier.height(40.dp))
             }
         }

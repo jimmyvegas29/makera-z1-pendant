@@ -27,6 +27,7 @@ import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Before
@@ -178,6 +179,49 @@ class ProbeSimTest {
         val r4 = (runAndWait(vm) as RunState.Done).result
         assertEquals(-120.0, r4.machine.centerX!!, 1e-3); assertEquals(-130.0, r4.machine.centerY!!, 1e-3)
         assertEquals(60.0, r4.widthX!!, 1e-3); assertEquals(40.0, r4.widthY!!, 1e-3)
+        p.reset()
+
+        // Edge, 2 points along, on a part turned 0.2° (counter-clockwise from above): the front edge
+        // runs back toward the right, 6 mm × tan 0.2° = 0.021 mm over the length. Multiple points
+        // only measure, even with Set work zero picked.
+        link.sendLine("simprobe skew 0.2")
+        idleAt(link, -118.0, -145.0, -65.0)
+        p.mode.value = ProbeMode.SET_ZERO
+        p.update(ProbeSetup(ProbeKind.EDGE, edge = com.z1pendant.probe.Side.FRONT, edgeMulti = true, edgeCount = 2, edgeLength = 6.0))
+        val r5 = (runAndWait(vm) as RunState.Done).result
+        assertEquals(ProbeMode.MEASURE, r5.mode); assertEquals(emptySet<Char>(), r5.zeroSet)
+        assertEquals(0.02094, r5.fit!!.delta, 0.002)
+        assertEquals(0.2, r5.fit!!.degrees, 0.02)
+        assertNull("2 touches: no straightness", r5.fit!!.straightness)
+        p.reset()
+
+        // 1 point, Set work zero: Y0 goes on the edge, X untouched.
+        idleAt(link, -118.0, -145.0, -65.0)
+        val b5 = offsets(link)
+        p.update(p.setup.value.copy(edgeMulti = false))
+        val r6 = (runAndWait(vm) as RunState.Done).result
+        assertEquals(setOf('Y', 'Z'), r6.zeroSet)
+        withTimeout(5_000) { while (kotlin.math.abs(offsets(link)[1] - r6.machine.edgeY!!) > 1e-3) delay(30) }
+        assertEquals("X untouched", b5[0], offsets(link)[0], 1e-3)
+        p.reset(); p.mode.value = ProbeMode.MEASURE
+
+        // Started beside the front edge, below the top (Z −72, top −70): 4 touches over 30 mm to the
+        // right, no top touch and no Z move. The 0.2° turn shows as 30 × tan 0.2° = 0.105 mm, and the
+        // edge is straight (all four on the line).
+        idleAt(link, -130.0, -155.0, -72.0)
+        p.update(ProbeSetup(ProbeKind.EDGE, edge = com.z1pendant.probe.Side.FRONT, edgeFromHere = true, y = 10.0,
+            edgeMulti = true, edgeCount = 4, edgeLength = 30.0, alongSign = 1))
+        val r7 = (runAndWait(vm) as RunState.Done).result
+        assertNull("no top", r7.machine.top)
+        assertEquals(4, r7.machine.edgeTouches.size)
+        assertEquals(0.1047, r7.fit!!.delta, 0.003)
+        assertEquals(0.2, r7.fit!!.degrees, 0.01)
+        assertTrue("straight", r7.fit!!.straightness!! < 0.002)
+        val end = withTimeout(10_000) { delay(400); while (link.status.value?.isIdle != true) delay(30); link.status.value!! }
+        assertEquals("backs off to where it started", -155.0, end.mpos[1], 1e-3)
+        assertEquals("never moved Z", -72.0, end.mpos[2], 1e-3)
+        assertEquals("back along to where it was parked", -130.0, end.mpos[0], 1e-3)
+        link.sendLine("simprobe skew 0")
         p.reset()
 
         // A dead probe: the touch never comes, the machine alarms, the run says so.

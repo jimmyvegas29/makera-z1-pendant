@@ -89,6 +89,14 @@ added once to existing hotkey sets) or a file's sheet.
   live (`config-get sd coordinate.anchor1_x/_y`); where the spindle is = `G10L20P0X0Y0` (sent once per choice).
   "Same as CAM" = the community post's "X/Y Offset" header lines (the WCS from Fusion's part attach point:
   only right if the setup's part position is set and the stock sits in the bracket).
+- Custom anchors (`run/Anchors.kt`, `ui/AnchorsScreen.kt`; built 2026-11-24 instead of PR #10 writing
+  `coordinate.anchor1_*`, which would also move the tool setter = Anchor 1 + 181 mm): named points in machine
+  coordinates, each axis optional, saved in prefs as JSON under `anchors.<machine name>`. Run's "Custom anchor"
+  (radio + dropdown, no list) sends `G10L2P0X<x+off>Y<y+off>[Z<z>]`; with a saved Z the Z probe is off by
+  default, without one it's locked on as with Anchor 1. Settings › Anchors: New (probe a corner / an edge with
+  the wizard, where the spindle is, or typed), Edit, Delete, Re-probe (saved vs measured, then keep / save /
+  save as new). After the wizard sets a zero, the anchor is read with `$#` (`[G54:x,y,z,…]`, the work offset
+  itself, so Z holds with any tool whose length is measured); no answer in 3 s falls back to MPos − WPos for X/Y.
 - The firmware's M495 (community `ATCHandler.cpp`) inserts its own M6 T0 unless the active tool is 0, and
   refuses an uncalibrated probe. So before Scan now or a start that probes, the pendant gets the laser probe
   in itself: `M6 T0` (swap + setter calibration) or, "already in", `M493.2 T0` then `M491` (setting the
@@ -345,6 +353,67 @@ can't use them to move the machine.
 - Simulator: `python3 python/z1sim.py`, then connect the app to that computer's IP (or
   `adb reverse tcp:2222 tcp:2222` and `--es host 127.0.0.1`).
 
+- `… --es updateurl http://<pc>:8000/latest.json` runs the update check against a stand-in for GitHub's
+  release JSON (same shape as `releases/latest`; its APK URL can point at the same server). The dialog
+  shows on the main screen.
+
+## App updates
+`update/UpdateController.kt`, with the phone's side in `Updater` (`AndroidUpdater`, `IosUpdater`).
+- **Check:** at start (Settings › App can turn it off), at most every 6 h; between checks the last reply
+  (kept in the prefs) is reused, so a found update is still offered. `GET
+  https://api.github.com/repos/jimmyvegas29/makera-z1-pendant/releases/latest`, no token (GitHub allows 60
+  an hour per IP), `User-Agent: Z1-Pendant/<version>`; nothing else is sent. A failed check is quiet (no
+  internet at the machine is normal); Settings says why. `releases/latest` never returns drafts or
+  pre-releases.
+- **Version:** `BuildInfo.VERSION`, generated into `:shared` from `pendantVersionName` in
+  `android/gradle.properties` (the Android app's `versionName`/`versionCode` come from there too). The
+  .ipa workflow writes the tag's version into `Info.plist`. Compared number by number (`0.1.10` >
+  `0.1.9`).
+- **Dialog:** once per version found by the startup check, on the main screen only; Later asks again next
+  start, Skip this version stops the dialog (Settings still offers it).
+- **Android install:** waits while a job runs or the machine moves (installing closes the app). Downloads
+  the release's `.apk` into the cache, checks size and SHA-256 against the asset's `digest` from GitHub
+  (refuses without one), then the package name, a newer `versionCode` and the signing certificate
+  (`GET_SIGNING_CERTIFICATES`; a self-built app gets a clear "uninstall first" instead of Android's
+  conflict error). Then a `PackageInstaller` session; its status comes back to a not-exported receiver,
+  which opens Android's confirm dialog (`STATUS_PENDING_USER_ACTION`). Needs `REQUEST_INSTALL_PACKAGES`;
+  without the user's "Install unknown apps" OK, Android's page for it is opened and the user taps Update
+  again. The cached APK is deleted at the next start.
+- **iPhone:** check only; Update opens the release page (an app can't install itself, and a sideloaded one
+  is signed with each user's own Apple ID).
+
+## Edge probing
+`probe/ProbeModel.kt` (`ProbeSequences.edge`, `EdgeFit`), the wizard in `ui/ProbeWizard.kt`; spec from
+Jimmy's review in the parent project's `field_test/edge_probing_feedback.md`.
+- Setup starts with nothing picked but the probe (`Pick`, `missingPick`); the values behind the picks are still
+  remembered in the prefs. Corner / hole / block axes are set all on in `openWizard`.
+- **Touch the top first**: over the part; top, then out by the start offset (G53 G0), down to the side depth
+  (G53 G1), G38.2 in; between touches back out and up before moving along. **Start from here**
+  (`edgeFromHere`): no Z at all; G38.2 straight in by the search distance, back to the start line, along the
+  start line to the next touch, back to the start position at the end (`Steps.BACK_OFF`).
+- **Multiple points**: `edgeCount` (2–8) over `edgeLength`, spacing = length / (count − 1), always Measure
+  only. `EdgeFit`: least squares through the touches; angle, delta over the length, per 100 mm, residuals
+  (+ = out of the part), straightness = peak to valley (3+ touches), noise = atan(0.005 / √Σ(t − t̄)²).
+- `ProbeSetup.travelCheck` checks every touch's along position (and, touching the top first, the step out)
+  against `SoftLimits`; Run greys out with the reason.
+- Opened for a zero (Run's origin, Anchors): Multiple points isn't offered. **Save as anchor** on the result
+  (`AnchorsController.probedPoint` + `saveProbed`): the work zero the run set, read back with `$#`, or the
+  measured X/Y; X/Y/Z chips choose what's kept.
+- Sim: `z1sim_probe.py` `simprobe skew <deg>`, `lean <deg>`, `bow <mm>` (hollow sides) shape the part.
+- Tests: `ProbeTest` (sequences against a fake part, `EdgeFit`, travel check, picks), `ProbeSimTest` (2 points
+  on a skewed part, start from here with 4 touches), `AnchorsSimTest` (save from a probe result).
+
+## Bed map
+`map/BedMap.kt`, `ui/MapScreen.kt`, `AppViewModel.mapGo` (spec: parent project `field_test/bed_map_spec.md`).
+- The soft-limit box (`SoftLimits.bed`, else the Z1's), back at the top. Grid 5/9/17 points edge to edge
+  (`map.grid`), anchors with both X and Y, and X0 Y0 (MPos − WPos); targets within 0.01 mm merge into one
+  with all their names. The tool setter is drawn from the last calibration's setter touch (`probe.setterXY`).
+- Move here = `G90`, `G53 G0 Z-2` (Safe Z, on every time the map opens), `G53 G0 X Y`. Lift ends at Z −2,
+  Move when Idle at the target; Stop = reset. Idle somewhere else = "stopped short".
+- The bottom panel has a fixed height so the map never moves when the card changes. The map also opens
+  over the probe wizard from Move the probe into place.
+- Tests: `MapTest` (grid, merged targets, snapping, move lines), `MapSimTest` (Safe Z on and off).
+
 ## Confirmed on a real Z1 Pro (stock firmware 1.1.3.0.1.13)
 - Discovery broadcast: `Makera_Z1P_xxxxxx,<ip>,2222,0,Idle`. The 5th field is the machine state; "busy"
   stayed 0 with Makera Studio connected.
@@ -374,8 +443,15 @@ skipped queue delay doesn't show. `$J F0.05` ran at about 60 mm/min, so its rate
 ## Still unverified
 - The Run flow on the real Z1 (built and run against the simulator 2026-11-17): M495 with O/F/A/B/I/J/H letters,
   Scan now outside a job, the "Done ATC" end of a direct M495, the `|O:` format, and `M375.1`'s output.
+- Custom anchors on the real Z1: the `$#` reply format (format strings found in the stock LPC dump, not run live)
+  and G10 L2 with Z.
 - The file download on the real machine (protocol from the Makera app + Wi-Fi board decompiles; run on the simulator).
 - Whether the stock firmware takes `M223` with two decimals and what its spindle "target" field means.
 - Y/Z upper soft limits (assumed −1 like X; the community `Robot.cpp` sets all three to −1).
+- In-app updates: the Android install (PackageInstaller session, the "Install unknown apps" page, the confirm
+  dialog) on a real phone, and `IosUpdater` compiled for iOS (written on Windows; the check and dialog
+  logic is unit-tested, the GitHub reply checked live).
+- Edge probing's Start from here and Multiple points, the bed map's moves and Save as anchor on the real Z1
+  (built 2026-11-27, run on the simulator; Jimmy tested the first edge version and the map on the Z1).
 - `M211`'s report on a real Z1 and a real Carvera Air (the format strings are in the stock Z1 dump; seen
   only on the simulator so far).

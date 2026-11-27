@@ -37,17 +37,21 @@ tap a jog pad, run your own hotkeys, and see live positions, all over Wi-Fi with
   - It opens by itself when a job runs, the machine holds or alarms, or something else moves it.
   - Hold, Resume and Stop stay quiet while idle and light up when they matter: Hold and Stop while
     moving, Resume on hold, Stop in an alarm. During a job, Stop reads **Cancel job**.
+  - Resume also continues a job that the file itself paused (`M600`).
 - **Files**: browse the machine's SD card, upload from your phone, rename, delete, and tap a file for
   its sheet: **Run**, and **Job info** (its tools and header). An upload can be cancelled at any point,
   and the machine then deletes the part it had received. On Android you can also send a file straight
   from another app (Files, Drive, Gmail): **Share → Z1 Pendant**, and the pendant asks before uploading it.
   Android's own file picker has no Cancel button; swipe in from the screen edge to back out of it.
+  - **Move**: hold a file or folder to select it (tap more to add them), then drag onto a folder, or onto a
+    folder in the path at the top. Long names work: the Z1 only takes short file commands, so the pendant
+    moves a long one through a short temporary name.
 - **Run a job**: the Run tile (or Run in a file's sheet) sets up and starts a job the way Makera Studio does.
   It only opens while the machine is Idle. A map of the bed shows the **cutting area** (the box the cutting
   moves cover), the origin, where the spindle is, the anchor bracket, the Z probe point and the leveling
   grid as you go, and warns if the job would run past the bed.
   1. **Origin**: keep the current zero, **Anchor 1** plus an offset (0, 0 is the bracket's inside
-     corner), where the spindle is, or the **3D probe**: Next opens probing, and you can only go on once
+     corner), a **custom anchor** plus an offset, where the spindle is, or the **3D probe**: Next opens probing, and you can only go on once
      it has set an X/Y zero.
   2. **Checks**: Probe Z at start (required with Anchor 1), the margin scan (**Scan now**, and/or at the
      start of the job) and auto leveling (start height, edge inset, grid points). They start off on every
@@ -100,6 +104,9 @@ tap a jog pad, run your own hotkeys, and see live positions, all over Wi-Fi with
 - **Console**: every command sent and every reply, with time stamps, plus a box to type commands.
 - **Machine name**: shows at the top even when you connect by IP address (read from the machine).
   Settings can hide its serial number, for screen recordings.
+- **Update check**: when the app starts it asks GitHub whether there's a newer release and shows
+  what's new. On Android, **Update** downloads it, checks it and installs it (Android asks you to
+  confirm); on iPhone it opens the release page. Can be turned off in Settings.
 - **Toggles that show state**: the Light and Vacuum tiles are bright when on, dim when off (read back
   from the machine).
 - **Spindle**: the Spindle tile is dim while off; tap it for the start box (always asks): pick a preset
@@ -107,10 +114,28 @@ tap a jog pad, run your own hotkeys, and see live positions, all over Wi-Fi with
   turns blue and shows the live RPM, also during a job; tap it to stop (it asks first, every time). It refuses to start with no tool or the probe loaded
   (the firmware would halt the machine) and offers a − T1 + stepper to set the tool number (no motion).
 - Works alongside Makera Studio: both can be connected at the same time.
-- **Probing**: outside corner, inside corner, hole center, block center (round or square) and Top only,
-  with the 3D probe, the probe rod (metal parts) or the laser probe (Top only).
-  - **Axes to probe**: X, Y and Z are toggles; only the axes that are on are touched and set (a hole
-    has no Z). With Z off it doesn't touch the top: it takes your current Z0 as the top and touches
+- **Bed map**: the map button (bottom-right of the dial, or beside the dial/jog pad switch) opens the
+  machine's whole travel with a grid of points (5 × 5, 9 × 9 or 17 × 17), your anchors, X0 Y0, the tool
+  setter and the spindle. Tap a point, an anchor or X0 Y0, then **Move here**: Z goes all the way up first,
+  then X and Y. Turn **Safe Z** off to move at the height Z is at (sweeping a part with an indicator).
+  Marks on the same spot (an anchor where X0 Y0 is) are drawn inside each other with both names.
+- **Custom anchors** (Settings › Anchors): named points on the bed in machine coordinates (a vise jaw, a
+  fixture plate), so they hold after every homing. Set one by probing a corner or an edge, from where the
+  spindle is, or by typing it; **Re-probe** shows saved against measured. Run can use one as the job's
+  origin, plus an offset; with a saved Z the job can skip its Z probe. Saved per machine on the phone; the
+  Z1's own Anchor 1 (and the tool setter that hangs off it) is never touched.
+- **Probing**: outside corner, inside corner, hole center, block center (round or square), Top only and
+  edge, with the 3D probe, the probe rod (metal parts) or the laser probe (Top only).
+  - Nothing but the probe is picked when probing opens: pick the operation, and each choice it needs
+    appears in turn. **Move the probe into place** has the bed map, to get there quicker.
+  - **Edge**: which edge, then **Touch the top first** (start over the part) or **Start from here** (the
+    ball already beside the part at touching height: it goes straight in and backs off, Z never moves).
+    **1 point** sets that axis's zero. **Multiple points** (2–8 over a total length) only measures: how
+    far the edge is out of square (a best-fit line), and with 3 or more how straight it is, touch by
+    touch. Every touch is checked against the machine's travel before it starts.
+  - **Save as anchor** on the result: a name, and which of X, Y, Z to keep.
+  - **Axes to probe**: X, Y and Z are toggles, all on each time probing opens; only the axes that are
+    on are touched and set (a hole has no Z). With Z off it doesn't touch the top: it takes your current Z0 as the top and touches
     the sides that far below it, so set Z first (Top only does that). It won't start below Z0.
   - **Set work zero** runs Makera's own probing routine (`M480`), the same one Makera Studio uses,
     when the axes match one of Makera's (a corner with X, Y and Z, a hole, a block center with Z).
@@ -200,7 +225,13 @@ The app isn't on the Play Store, so you install the APK file yourself ("sideload
    (it's unknown only because it isn't from the Play Store).
 5. Open **Z1 Pendant**. No permissions to grant: everything it needs is allowed at install.
 
-**Updating:** install the newer APK the same way; your hotkeys and settings are kept.
+**Updating:** from 0.1.13 on, the app checks for a new release when it starts and offers it:
+tap **Update**, and the app downloads it, checks it against GitHub's checksum, and Android asks you to
+confirm. The first time, Android sends you to a page to allow Z1 Pendant to install apps: turn on
+**Allow from this source**, come back, and tap **Update** again. **Settings › App** shows your
+version, has **Check now**, and can turn the check off. The check only asks GitHub for the latest
+release; nothing about you or your machine is sent. Older versions: install the newer APK the same
+way as the first time. Either way your hotkeys and settings are kept.
 **Removing:** long-press the app icon → **Uninstall**.
 
 > Prefer installing from a computer? With [adb](https://developer.android.com/tools/adb) and USB
@@ -238,7 +269,8 @@ a paid Apple Developer account makes it a year). Two ways to deal with it:
   you changed it).
 
 Either way your settings and hotkeys are kept. To update to a new version, run step 4 with the new
-`.ipa`. ([AltStore Classic](https://faq.altstore.io/altstore-classic/how-to-install-altstore-windows)
+`.ipa`. From 0.1.13 on, the app tells you when there is one (an iPhone app can't install its own
+update): **Get the update** opens the release page, and **Settings › App** has **Check now**. ([AltStore Classic](https://faq.altstore.io/altstore-classic/how-to-install-altstore-windows)
 is another free tool that does the same job.)
 
 ### On a Mac
@@ -366,6 +398,8 @@ The full source is here. Make it your own.
   ```
   The APK lands in `android/app/build/outputs/apk/release/`. Builds are signed with your local debug
   key, so an APK you build can't update one installed from the releases page (uninstall that first).
+  For the same reason the in-app **Update** won't install a release over an app you built yourself (it
+  says so). The version number lives in `android/gradle.properties` (`pendantVersionName`/`Code`).
 - **Python tools** (`python/`, Python 3, no extra packages):
   - `z1sim.py`: a machine simulator. Point the app at your computer's IP to try everything with no machine.
     `z1sim_probe.py` adds a part on the table for probing, and the sim keeps an SD card folder for Files.

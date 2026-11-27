@@ -47,7 +47,27 @@ data class ProbeResult(
     val machine: Measured,
     /** Work offsets (machine − work) before the run, for Undo. */
     val before: List<Double>,
+    /** Edge, multiple points: the line through the touches. */
+    val fit: EdgeFit? = null,
 )
+
+/**
+ * The single choices on the Setup screen the user has made since probing was opened. Nothing is
+ * picked when it opens (the values behind them are still remembered, for the defaults), so each one
+ * is a deliberate tap; Next waits for all the ones the operation needs.
+ */
+enum class Pick { OPERATION, CORNER, SIDE, START, POINTS, DIRECTION }
+
+/** What the Setup screen still needs picked, as the Next button says it (null = ready). */
+fun ProbeSetup.missingPick(picks: Set<Pick>): String? = when {
+    Pick.OPERATION !in picks -> "Pick an operation"
+    kind.hasCorner && Pick.CORNER !in picks -> "Pick a corner"
+    kind == ProbeKind.EDGE && Pick.SIDE !in picks -> "Pick an edge"
+    kind == ProbeKind.EDGE && Pick.START !in picks -> "Pick where it starts"
+    kind == ProbeKind.EDGE && Pick.POINTS !in picks -> "Pick the touches"
+    multi && Pick.DIRECTION !in picks -> "Pick which way"
+    else -> null
+}
 
 /**
  * The 3D probe: its setup (remembered), whether the probe is in and calibrated this session, and
@@ -66,6 +86,12 @@ class ProbeController(
 ) {
     val setup = MutableStateFlow(loadSetup())
     val mode = MutableStateFlow(ProbeMode.SET_ZERO)
+    /** Setup choices made since probing was opened (see [Pick]); cleared when it closes. */
+    val picks = MutableStateFlow<Set<Pick>>(emptySet())
+    fun pick(p: Pick) { picks.value = picks.value + p }
+    fun unpick(p: Pick) { picks.value = picks.value - p }
+    /** What a run does: multiple points only ever measure. */
+    fun effectiveMode(s: ProbeSetup = setup.value) = if (s.multi) ProbeMode.MEASURE else mode.value
     /** The machine says T9999 and you said the probe really is in (the number can be left over). */
     val confirmed = MutableStateFlow(false)
     val calibrated = MutableStateFlow(false)
@@ -78,6 +104,12 @@ class ProbeController(
      * the laser probe (the margin scan, Z probe and leveling need it in, as tool 0).
      */
     @kotlin.concurrent.Volatile var checkAs: ProbeTool? = null
+    /**
+     * Where the tool setter is (machine X, Y), from the last calibration's setter touch: the bed map
+     * draws it. Null until a calibration has been seen on this phone.
+     */
+    val setterXY = MutableStateFlow(prefs.getString("probe.setterXY", null)?.split(',')?.mapNotNull { it.toDoubleOrNull() }
+        ?.takeIf { it.size == 2 }?.let { it[0] to it[1] })
 
     private var runJob: Job? = null
     private val runLines = Channel<String>(Channel.UNLIMITED)
@@ -137,6 +169,9 @@ class ProbeController(
             putString("probe.tool", s.tool.name)
             putFloat("probe.x", s.x.toFloat()); putFloat("probe.y", s.y.toFloat())
             putFloat("probe.depth", s.depth.toFloat()); putFloat("probe.tip", s.tip.toFloat())
+            putString("probe.edge", s.edge.name); putBoolean("probe.edgeFromHere", s.edgeFromHere)
+            putBoolean("probe.edgeMulti", s.edgeMulti); putInt("probe.edgeCount", s.edgeCount)
+            putFloat("probe.edgeLength", s.edgeLength.toFloat()); putInt("probe.alongSign", s.alongSign)
         }
     }
 
@@ -154,6 +189,12 @@ class ProbeController(
             tool = tool,
             x = prefs.getFloat("probe.x", d.x.toFloat()).toDouble(), y = prefs.getFloat("probe.y", d.y.toFloat()).toDouble(),
             depth = prefs.getFloat("probe.depth", d.depth.toFloat()).toDouble(), tip = prefs.getFloat("probe.tip", d.tip.toFloat()).toDouble(),
+            edge = e("probe.edge", Side.entries.toTypedArray(), d.edge),
+            edgeFromHere = prefs.getBoolean("probe.edgeFromHere", d.edgeFromHere),
+            edgeMulti = prefs.getBoolean("probe.edgeMulti", d.edgeMulti),
+            edgeCount = prefs.getInt("probe.edgeCount", d.edgeCount).coerceIn(ProbeSetup.MIN_POINTS, ProbeSetup.MAX_POINTS),
+            edgeLength = prefs.getFloat("probe.edgeLength", d.edgeLength.toFloat()).toDouble(),
+            alongSign = if (prefs.getInt("probe.alongSign", d.alongSign) < 0) -1 else 1,
         ).normalized()
     }
 
@@ -219,10 +260,14 @@ class ProbeController(
      */
     fun openWizard() {
         checkAs = null
+        // Corner / hole / block axes start all on each time (they used to be remembered, and an X left
+        // off from some earlier run came back unnoticed: Jimmy, 2026-11-27).
+        setup.value.let { if (!(it.axisX && it.axisY && it.axisZ)) update(it.copy(axisX = true, axisY = true, axisZ = true)) }
         if (toolAction.value?.let { it.stage != ToolAction.Stage.DONE && it.error == null } != true) recalibrating()
     }
 
-    fun closeWizard() = reset()
+    /** Probing closed: the next open starts with nothing picked. */
+    fun closeWizard() { picks.value = emptySet(); reset() }
 
     // ---- which probe is in ----------------------------------------------------------------------
     /** Each probe's learned setter Z (machine coordinates), from earlier calibrations. */
@@ -266,7 +311,10 @@ class ProbeController(
             }
             slowTouchNext && line.startsWith("[PRB:") -> {
                 slowTouchNext = false
-                parsePrb(line)?.takeIf { it.second }?.let { setterZ = it.first.z }
+                parsePrb(line)?.takeIf { it.second }?.let { (t, _) ->
+                    setterZ = t.z
+                    if (setterXY.value != t.x to t.y) { setterXY.value = t.x to t.y; prefs.edit { putString("probe.setterXY", "${f3(t.x)},${f3(t.y)}") } }
+                }
             }
             line.startsWith("M492.3") -> a?.let { toolAction.value = it.copy(stage = ToolAction.Stage.CHECKING) }
             line.startsWith("Done ATC") && sawSetter && a != null && a.error == null -> {
@@ -292,7 +340,7 @@ class ProbeController(
         if (link.conn.value != ConnState.Connected || st == null || !st.isIdle) {
             run.value = RunState.Failed("The machine isn't ready (${st?.state ?: "not connected"}).", null, "Nothing changed."); return
         }
-        val s = setup.value; val m = mode.value
+        val s = setup.value; val m = effectiveMode(s)
         s.startProblem(st.wpos.getOrNull(2))?.let { run.value = RunState.Failed(it, null, "Nothing changed."); return }
         val before = offsets(st)
         val start = Touch(st.mpos[0], st.mpos[1], st.mpos[2])
@@ -393,10 +441,12 @@ class ProbeController(
                 link.dialect.setWorkPosition(v).forEach { io.send(it) }
             }
         }
+        val fit = if (s.multi && meas.edgeTouches.size >= 2)
+            EdgeFit(meas.edgeAlong.map { (it - meas.edgeAlong[0]) * s.alongSign }, meas.edgeTouches, outSign = -s.edge.dir) else null
         return ProbeResult(m, s,
             zeroX = meas.zeroX?.let { it - before[0] }, zeroY = meas.zeroY?.let { it - before[1] },
             top = meas.top?.let { it - before[2] }, widthX = meas.widthX, widthY = meas.widthY,
-            zeroSet = set, machine = meas, before = before)
+            zeroSet = set, machine = meas, before = before, fit = fit)
     }
 
     /** The link as the sequences need it: one line at a time, each waiting for its answer. */

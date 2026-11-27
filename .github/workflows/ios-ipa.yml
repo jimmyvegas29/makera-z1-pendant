@@ -43,6 +43,15 @@ jobs:
           key: ios-${{ runner.os }}-${{ hashFiles('android/**/*.gradle.kts', 'android/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: ios-${{ runner.os }}-
 
+      - name: Version from the tag
+        run: |
+          # The iPhone app shows the release's version (Info.plist isn't always bumped by hand).
+          V="${TAG#v}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $V" ios/iosApp/Info.plist
+          C=$(sed -n 's/^pendantVersionCode=//p' android/gradle.properties)
+          if [ -n "$C" ]; then /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $C" ios/iosApp/Info.plist; fi
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" -c "Print :CFBundleVersion" ios/iosApp/Info.plist
+
       - name: Build (unsigned)
         working-directory: ios
         run: |

@@ -13,8 +13,9 @@ android {
         applicationId = "com.z1pendant"
         minSdk = 31            // VibrationEffect composition primitives (TICK / CLICK / THUD)
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.1.12"
+        // Both from gradle.properties (shared with BuildInfo.VERSION in :shared).
+        versionCode = providers.gradleProperty("pendantVersionCode").get().toInt()
+        versionName = providers.gradleProperty("pendantVersionName").get()
     }
 
     buildTypes {

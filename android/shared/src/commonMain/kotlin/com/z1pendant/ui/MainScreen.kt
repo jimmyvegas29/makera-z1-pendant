@@ -70,7 +70,7 @@ val LocalLandscape = androidx.compose.runtime.staticCompositionLocalOf { false }
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun MainScreen(vm: AppViewModel, onSettings: () -> Unit, onConsole: () -> Unit, onFiles: () -> Unit = {}, onEdit: (Hotkey?) -> Unit,
-               scroll: androidx.compose.foundation.ScrollState = rememberScrollState(), onProbe: () -> Unit = {}) {
+               scroll: androidx.compose.foundation.ScrollState = rememberScrollState(), onProbe: () -> Unit = {}, onMap: () -> Unit = {}) {
     val conn by vm.link.conn.collectAsState()
     val st by vm.link.status.collectAsState()
     val job by vm.job.collectAsState()
@@ -231,6 +231,11 @@ fun MainScreen(vm: AppViewModel, onSettings: () -> Unit, onConsole: () -> Unit, 
                 modifier = Modifier.align(Alignment.Center).padding(top = 52.dp))
             ModeButton(padMode, Modifier.align(Alignment.TopStart)) { vm.setJogPad(!padMode) }
             ProbeButton(Modifier.align(Alignment.TopEnd)) { vm.haptics.press(); onProbe() }
+            // Bed map: the dial is round, so its bottom-right corner is free; the jog pad fills the
+            // bottom corners, so there it sits beside the dial/pad switch in the top row.
+            MapButton(if (padMode) Modifier.align(Alignment.TopStart).padding(start = 58.dp) else Modifier.align(Alignment.BottomEnd)) {
+                vm.haptics.press(); onMap()
+            }
         }
         // Hotkeys: Edit (drag to rearrange) turns into Save; + adds one. Hold a tile 2 s to edit it.
         val hotkeyActions: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit = {

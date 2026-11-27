@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import com.z1pendant.probe.Corner
 import com.z1pendant.probe.ProbeKind
 import com.z1pendant.probe.ProbeTool
+import com.z1pendant.probe.edgeTouchLabels
 import com.z1pendant.probe.finishLabel
 import kotlin.math.PI
 import kotlin.math.cos
@@ -135,7 +136,30 @@ fun ProbeKindArt(kind: ProbeKind, size: Dp, square: Boolean = false) = Canvas(Mo
                 zero(iso, c, c, z0 + h)
             }
             ProbeKind.TOP -> { val iso = Iso(30f, 52f, 1.45f); box(iso, 0f, 0f, 0f, 20f, 20f, 6f); zero(iso, 10f, 10f, 6f) }
+            ProbeKind.EDGE -> {
+                // The part with one top edge in blue and two touch marks on it.
+                val iso = Iso(30f, 48f, 1.5f); box(iso, 0f, 0f, 0f, 20f, 17f, 7f)
+                drawLine(BL, iso.p(0f, 0f, 7f), iso.p(20f, 0f, 7f), 2.2f, StrokeCap.Round)
+                for (x in listOf(5.5f, 14.5f)) drawPath(iso.path(circ(x, -2.2f, 7f, 1.6f, n = 20)), BL)
+            }
         }
+    }
+}
+
+/** Edge picker: the part from above with the chosen side in blue and the probe outside it. */
+@Composable
+fun EdgeArt(side: com.z1pendant.probe.Side, size: Dp) = Canvas(Modifier.size(size)) {
+    fit(0f, 0f, 60f, 60f) {
+        drawRoundRect(FILL, Offset(14f, 14f), Size(32f, 32f), CornerRadius(1f))
+        drawRoundRect(ST, Offset(14f, 14f), Size(32f, 32f), CornerRadius(1f), style = Stroke(1.4f))
+        val (a, b, dot) = when (side) {
+            com.z1pendant.probe.Side.FRONT -> Triple(Offset(14f, 46f), Offset(46f, 46f), Offset(30f, 53f))
+            com.z1pendant.probe.Side.BACK -> Triple(Offset(14f, 14f), Offset(46f, 14f), Offset(30f, 7f))
+            com.z1pendant.probe.Side.LEFT -> Triple(Offset(14f, 14f), Offset(14f, 46f), Offset(7f, 30f))
+            com.z1pendant.probe.Side.RIGHT -> Triple(Offset(46f, 14f), Offset(46f, 46f), Offset(53f, 30f))
+        }
+        drawLine(BL, a, b, 3.2f, StrokeCap.Round)
+        drawCircle(BL, 3.4f, dot)
     }
 }
 
@@ -216,6 +240,91 @@ private fun DrawScope.arrowHeads(x1: Float, y1: Float, x2: Float, y2: Float, c: 
 
 enum class FieldArt { X, Y, DEPTH, TIP }
 
+private val AMBER = Color(0xFFF59E0B)
+private val BAD = Color(0xFFEF4444)
+
+/** The edge drawings are made for the front edge (probe coming in from the front) and turned for the others. */
+private fun edgeTurn(side: com.z1pendant.probe.Side) = when (side) {
+    com.z1pendant.probe.Side.FRONT -> 0f; com.z1pendant.probe.Side.BACK -> 180f
+    com.z1pendant.probe.Side.LEFT -> 90f; com.z1pendant.probe.Side.RIGHT -> -90f
+}
+
+/** Once turned, whether "+ along the edge" ([com.z1pendant.probe.ProbeSetup.alongSign] = +1) points right in the front-edge drawing. */
+private fun edgeK(side: com.z1pendant.probe.Side) = if (side == com.z1pendant.probe.Side.FRONT || side == com.z1pendant.probe.Side.RIGHT) 1 else -1
+
+/**
+ * "Where does it start?": from the side, the probe over the part ready to touch the top first, or
+ * already beside the part at touching height, going straight in.
+ */
+@Composable
+fun StartArt(fromHere: Boolean, tool: ProbeTool, modifier: Modifier) = Canvas(modifier) {
+    fit(0f, 0f, 70f, 42f) {
+        if (!fromHere) {
+            drawRoundRect(FILL, Offset(6f, 24f), Size(46f, 16f), CornerRadius(1f)); drawRoundRect(ST, Offset(6f, 24f), Size(46f, 16f), CornerRadius(1f), style = Stroke(1f))
+            probeSide(30f, 13f, 3f, 0.55f, tool)
+            drawLine(BL, Offset(30f, 17f), Offset(30f, 23f), 1.1f, pathEffect = dot)
+        } else {
+            drawRoundRect(FILL, Offset(4f, 12f), Size(40f, 28f), CornerRadius(1f)); drawRoundRect(ST, Offset(4f, 12f), Size(40f, 28f), CornerRadius(1f), style = Stroke(1f))
+            drawLine(BL, Offset(44f, 12f), Offset(44f, 40f), 2f)
+            probeSide(58f, 27f, 3f, 0.55f, tool)
+            drawLine(BL, Offset(54f, 27f), Offset(47.5f, 27f), 1.1f, pathEffect = dot)
+        }
+    }
+}
+
+/**
+ * The touches along an edge, from above: the part, the [side] in blue, [count] touches going the way
+ * [sign] picks (the first one filled), and the length in amber with an arrow toward the last. Touches
+ * in [bad] (past the machine's travel) are red.
+ */
+@Composable
+fun EdgePointsArt(side: com.z1pendant.probe.Side, sign: Int, count: Int, modifier: Modifier, bad: Set<Int> = emptySet(), showWay: Boolean = true) = Canvas(modifier) {
+    fit(0f, 0f, 60f, 60f) {
+        rotate(edgeTurn(side), pivot = Offset(30f, 30f)) {
+            drawRoundRect(FILL, Offset(6f, 6f), Size(48f, 30f), CornerRadius(1f)); drawRoundRect(ST, Offset(6f, 6f), Size(48f, 30f), CornerRadius(1f), style = Stroke(1f))
+            drawLine(BL, Offset(6f, 36f), Offset(54f, 36f), 2f)
+            val n = count.coerceAtLeast(1)
+            val fwd = edgeK(side) * sign > 0
+            val xs = (0 until n).map { i -> if (n == 1) 30f else 11f + 38f * i / (n - 1) }.let { if (fwd) it else it.reversed() }
+            xs.forEachIndexed { i, x ->
+                val c = if (i in bad) BAD else BL
+                if (i == 0 && showWay) drawCircle(c, 2.8f, Offset(x, 40f)) else drawCircle(c, 2.4f, Offset(x, 40f), style = Stroke(1f))
+            }
+            if (n > 1 && showWay) {
+                val a = xs.first(); val b = xs.last()
+                drawLine(AMBER, Offset(a, 47f), Offset(a, 53f), 0.8f)
+                drawLine(AMBER, Offset(b, 47f), Offset(b, 53f), 0.8f)
+                arrowHeads(a, 50f, b, 50f, if (bad.isEmpty()) AMBER else BAD, false)
+            }
+        }
+    }
+}
+
+/**
+ * The edge's X / Y field: touching the top first, the ball over the part, out past the edge (dotted
+ * ring) and back in; started beside the part, the ball outside going straight in, how far it searches
+ * in amber. Drawn for the front edge and turned to [side].
+ */
+private fun DrawScope.edgeOffsetArt(side: com.z1pendant.probe.Side, fromHere: Boolean) {
+    fit(0f, 0f, 60f, 60f) {
+        rotate(edgeTurn(side), pivot = Offset(30f, 30f)) {
+            drawRoundRect(FILL, Offset(6f, 4f), Size(48f, 30f), CornerRadius(1f)); drawRoundRect(ST, Offset(6f, 4f), Size(48f, 30f), CornerRadius(1f), style = Stroke(1.2f))
+            drawLine(BL, Offset(6f, 34f), Offset(54f, 34f), 2f)
+            if (!fromHere) {
+                drawLine(BL, Offset(30f, 26f), Offset(30f, 52f), 1.5f, pathEffect = dash)
+                drawCircle(BL, 3.6f, Offset(30f, 55f), style = Stroke(1.2f, pathEffect = dot))
+                probeTop(30f, 26f)
+            } else {
+                drawLine(BL, Offset(30f, 50f), Offset(30f, 38f), 1.5f, pathEffect = dash)
+                arrowHeads(30f, 46f, 30f, 37.5f, BL, false)
+                probeTop(30f, 52f)
+                drawLine(AMBER, Offset(40f, 34f), Offset(46f, 34f), 0.8f); drawLine(AMBER, Offset(40f, 52f), Offset(46f, 52f), 0.8f)
+                arrowHeads(43f, 52f, 43f, 34f, AMBER, true)
+            }
+        }
+    }
+}
+
 /**
  * The X / Y field picture for an inside corner, hole or block center, drawn for X in a 60 × 40 box
  * (top view); Y is the same turned a quarter so the move points toward the front. Outside corner
@@ -259,9 +368,11 @@ private fun DrawScope.offsetArt(kind: ProbeKind, isY: Boolean) {
 
 /** The little drawing on each B2 field (top view for X/Y, drawn for [kind]; side view for depth/tip). */
 @Composable
-fun FieldArtImage(which: FieldArt, modifier: Modifier, tool: ProbeTool = ProbeTool.PROBE_3D, kind: ProbeKind = ProbeKind.OUTSIDE) = Canvas(modifier) {
+fun FieldArtImage(which: FieldArt, modifier: Modifier, tool: ProbeTool = ProbeTool.PROBE_3D, kind: ProbeKind = ProbeKind.OUTSIDE,
+                  side: com.z1pendant.probe.Side? = null, fromHere: Boolean = false) = Canvas(modifier) {
     when {
-        (which == FieldArt.X || which == FieldArt.Y) && kind != ProbeKind.OUTSIDE && kind != ProbeKind.TOP ->
+        (which == FieldArt.X || which == FieldArt.Y) && kind == ProbeKind.EDGE && side != null -> edgeOffsetArt(side, fromHere)
+        (which == FieldArt.X || which == FieldArt.Y) && kind != ProbeKind.OUTSIDE && kind != ProbeKind.TOP && kind != ProbeKind.EDGE ->
             offsetArt(kind, which == FieldArt.Y)
         else -> fieldArt(which, tool)
     }
@@ -469,6 +580,32 @@ fun ProbeRunArt(setup: com.z1pendant.probe.ProbeSetup, labels: List<String>, ind
                     }
                     if (setup.doZ) topMark(cc)
                     finish(cc)
+                }
+                ProbeKind.EDGE -> {
+                    // From above, drawn for the front edge (probe coming in from the front) and turned
+                    // for the others. Touching the top first, it starts over the part and goes out,
+                    // along and back in for each touch; started beside the part, it starts outside
+                    // and goes straight in, along the start line between touches.
+                    val e = setup.edge
+                    rotate(edgeTurn(e), pivot = Offset(60f, 47.5f)) {
+                        drawRoundRect(FILL, Offset(20f, 14f), Size(80f, 48f), CornerRadius(1.5f))
+                        drawRoundRect(ST, Offset(20f, 14f), Size(80f, 48f), CornerRadius(1.5f), style = Stroke(0.8f))
+                        drawLine(BL, Offset(20f, 62f), Offset(100f, 62f), 1.2f)
+                        val labels2 = setup.edgeTouchLabels()
+                        val n = labels2.size
+                        val fwd = edgeK(e) * setup.alongSign > 0
+                        val xs = (0 until n).map { i -> if (n == 1) 60f else 28f + 64f * i / (n - 1) }.let { if (fwd) it else it.reversed() }
+                        val line = if (setup.fromHere) 80f else 84f
+                        val s = Offset(xs[0], if (setup.fromHere) 80f else 50f); start(s)
+                        xs.forEachIndexed { i, x ->
+                            val c = col(labels2[i])
+                            val legs = if (i == 0) (if (setup.fromHere) listOf(s, Offset(x, 64.8f)) else listOf(s, Offset(x, line), Offset(x, 64.8f)))
+                                else listOf(Offset(xs[i - 1], line), Offset(x, line), Offset(x, 64.8f))
+                            path(c, legs); touch(c, Offset(x, 64.8f), isNow(labels2[i]), Offset(x, 62f))
+                        }
+                        if (setup.doZ) topMark(s)
+                        finish(if (setup.fromHere) s else Offset(xs[0], 62f))
+                    }
                 }
                 ProbeKind.TOP -> {                                     // side view
                     drawRoundRect(FILL, Offset(20f, 52f), Size(80f, 34f), CornerRadius(1.5f))

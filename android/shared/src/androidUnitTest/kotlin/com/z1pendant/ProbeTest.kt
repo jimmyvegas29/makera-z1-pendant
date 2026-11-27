@@ -1,6 +1,11 @@
 package com.z1pendant
 
 import com.z1pendant.probe.Corner
+import com.z1pendant.probe.EdgeFit
+import com.z1pendant.probe.Pick
+import com.z1pendant.probe.missingPick
+import com.z1pendant.probe.Side
+import com.z1pendant.probe.Steps
 import com.z1pendant.probe.ProbeIo
 import com.z1pendant.probe.ProbeKind
 import com.z1pendant.probe.ProbeSequences
@@ -161,6 +166,109 @@ class ProbeTest {
         val w2 = World(0.0, 50.0, 0.0, 40.0, top = -60.0)
         val m2 = run(w2, ProbeSetup(ProbeKind.OUTSIDE, Corner.BACK_RIGHT, depth = 1.5), Touch(45.0, 35.0, -55.0))
         assertEquals(50.0, m2.edgeX!!, eps); assertEquals(40.0, m2.edgeY!!, eps)
+    }
+
+    @Test fun edgeOnePoint() {
+        val w = World(0.0, 50.0, 0.0, 40.0, top = -60.0)
+        val s = ProbeSetup(ProbeKind.EDGE, edge = Side.FRONT)
+        assertEquals(listOf(Steps.TOP, Steps.Y_SIDE, Steps.EDGE), s.stepLabels())
+        assertEquals("Edge · front", s.title())
+        assertNull("no Makera routine for an edge", s.makeraCommand())
+        val m = run(w, s, Touch(20.0, 5.0, -55.0))
+        assertEquals(0.0, m.edgeY!!, eps); assertNull(m.edgeX); assertEquals(-60.0, m.top!!, eps); assertEquals(listOf(0.0), m.edgeTouches)
+        assertEquals("parks over the edge at the start height", listOf(20.0, 0.0, -55.0), listOf(w.x, w.y, w.z))
+        assertTrue("never touches X", w.lines.none { it.startsWith("G38.2 X") })
+
+        // The edge's own Z choice, not the corners' Z toggle.
+        assertTrue("axisZ off doesn't turn off an edge's top touch", ProbeSetup(ProbeKind.EDGE, axisZ = false).doZ)
+    }
+
+    @Test fun edgeStartFromHere() {
+        val w = World(0.0, 50.0, 0.0, 40.0, top = -60.0)
+        // Parked beside the right edge, 5 mm out and 2 mm below the top.
+        val s = ProbeSetup(ProbeKind.EDGE, edge = Side.RIGHT, edgeFromHere = true, x = 10.0)
+        assertEquals(listOf(Steps.X_SIDE, Steps.BACK_OFF), s.stepLabels())
+        assertNull("it doesn't move Z, so there's no Z0 to need", s.startProblem(-30.0))
+        val m = run(w, s, Touch(55.0, 20.0, -62.0))
+        assertEquals(50.0, m.edgeX!!, eps); assertNull(m.top)
+        assertTrue("no top touch", w.lines.none { it.startsWith("G38.2 Z") })
+        assertTrue("never moves Z", w.lines.none { "Z" in it && it.startsWith("G53") })
+        assertTrue("searches at most the search distance", "G38.2 X-10.000 F100" in w.lines)
+        assertEquals("backs off to where it started", listOf(55.0, 20.0, -62.0), listOf(w.x, w.y, w.z))
+    }
+
+    @Test fun edgeMultipleAlongTopFirst() {
+        val w = World(0.0, 50.0, 0.0, 40.0, top = -60.0)
+        // Right edge (probe comes in −X), 2 touches 6 mm toward the front (−Y).
+        val s = ProbeSetup(ProbeKind.EDGE, edge = Side.RIGHT, edgeMulti = true, edgeCount = 2, edgeLength = 6.0, alongSign = -1)
+        assertEquals(listOf(Steps.TOP, "Touch 1 of 2", "Touch 2 of 2", Steps.EDGE), s.stepLabels())
+        assertEquals("Edge · right · 2 points", s.title()); assertEquals("front", s.alongWord())
+        assertEquals(listOf(0.0, -6.0), s.alongOffsets())
+        val m = run(w, s, Touch(45.0, 30.0, -55.0))
+        assertEquals(listOf(50.0, 50.0), m.edgeTouches); assertEquals(listOf(30.0, 24.0), m.edgeAlong)
+        // Before moving along the edge it goes back out to the full offset (X 65), at the start height.
+        val out = w.lines.indexOfLast { it == "G53 G0 X65.000" }
+        assertEquals("then along the edge", "G53 G0 Y24.000", w.lines[out + 1])
+        assertTrue("the second touch comes after", w.lines.drop(out).count { it.startsWith("G38.2 X") } == 2)
+        assertEquals("parks over the first touch's spot on the edge", listOf(50.0, 30.0, -55.0), listOf(w.x, w.y, w.z))
+    }
+
+    @Test fun edgeMultipleFromHere() {
+        val w = World(0.0, 50.0, 0.0, 40.0, top = -60.0)
+        // Beside the front edge (Y 0), 4 touches over 12 mm to the right.
+        val s = ProbeSetup(ProbeKind.EDGE, edge = Side.FRONT, edgeFromHere = true, y = 8.0, edgeMulti = true, edgeCount = 4, edgeLength = 12.0)
+        assertEquals(4.0, s.spacing, eps)
+        assertEquals(listOf("Touch 1 of 4", "Touch 2 of 4", "Touch 3 of 4", "Touch 4 of 4", Steps.BACK_OFF), s.stepLabels())
+        val m = run(w, s, Touch(20.0, -4.0, -62.0))
+        assertEquals(listOf(0.0, 0.0, 0.0, 0.0), m.edgeTouches); assertEquals(listOf(20.0, 24.0, 28.0, 32.0), m.edgeAlong)
+        assertEquals("8 touches (fast + slow each)", 8, w.lines.count { it.startsWith("G38.2 Y") })
+        assertTrue("never moves Z", w.lines.none { "Z" in it && it.startsWith("G53") })
+        assertEquals("ends where it was parked", listOf(20.0, -4.0, -62.0), listOf(w.x, w.y, w.z))
+    }
+
+    @Test fun edgeFitMath() {
+        val q = EdgeFit(listOf(0.0, 6.0), listOf(0.0, 0.021), outSign = 1)
+        assertEquals(0.2005, q.degrees, 1e-3); assertEquals(0.35, q.per100, 1e-9); assertEquals(0.021, q.delta, 1e-9)
+        assertNull(q.straightness); assertNull(q.shape())
+        assertEquals(0.0675, q.noiseDegrees, 1e-3)
+        // 5 touches over 80 mm, 0.30° out, hollow in the middle by 0.008 mm.
+        val t = listOf(0.0, 20.0, 40.0, 60.0, 80.0)
+        val bow = listOf(0.008, -0.004, -0.008, -0.004, 0.008)
+        val slope = kotlin.math.tan(0.3 * kotlin.math.PI / 180)
+        val f = EdgeFit(t, t.indices.map { -0.078 + slope * t[it] + bow[it] }, outSign = 1)
+        assertEquals(0.3, f.degrees, 1e-6); assertEquals(0.016, f.straightness!!, 1e-9)
+        bow.indices.forEach { assertEquals(bow[it], f.offLine[it], 1e-9) }
+        assertTrue(f.shape()!!, "hollow" in f.shape()!!)
+        // The same bow seen from the other side of the part bulges out instead.
+        assertTrue("bulges" in EdgeFit(t, t.indices.map { -0.078 + slope * t[it] + bow[it] }, outSign = -1).shape()!!)
+        // Straight within the probe's repeat.
+        assertTrue("Straight" in EdgeFit(t, t.map { slope * it }, 1).shape()!!)
+    }
+
+    @Test fun edgeTravelCheck() {
+        val lim = com.z1pendant.link.SoftLimits.Z1                      // X −207..−1, Y −206..−1
+        // Right edge, 3 touches 100 mm toward the front from Y −150: the third would be at Y −250.
+        val s = ProbeSetup(ProbeKind.EDGE, edge = Side.RIGHT, edgeMulti = true, edgeCount = 3, edgeLength = 100.0, alongSign = -1)
+        val c = s.travelCheck(Touch(-100.0, -150.0, -60.0), lim)
+        assertEquals(setOf(2), c.bad)
+        assertEquals("Touch 3 would be past the Y travel: shorten the length or start further back.", c.problem)
+        assertNull(s.copy(edgeLength = 40.0).travelCheck(Touch(-100.0, -150.0, -60.0), lim).problem)
+        // Touching the top first it steps out past the edge by the start offset: that has to fit too.
+        val out = ProbeSetup(ProbeKind.EDGE, edge = Side.RIGHT, x = 20.0).travelCheck(Touch(-10.0, -100.0, -60.0), lim)
+        assertEquals(setOf(0), out.bad); assertTrue(out.problem!!, "start offset" in out.problem!!)
+        assertNull("soft limits off: nothing to check", s.travelCheck(Touch(-100.0, -150.0, -60.0), lim.copy(enabled = false)).problem)
+    }
+
+    @Test fun setupPicks() {
+        val e = ProbeSetup(ProbeKind.EDGE)
+        assertEquals("Pick an operation", e.missingPick(emptySet()))
+        assertEquals("Pick an edge", e.missingPick(setOf(Pick.OPERATION)))
+        assertEquals("Pick where it starts", e.missingPick(setOf(Pick.OPERATION, Pick.SIDE)))
+        assertEquals("Pick the touches", e.missingPick(setOf(Pick.OPERATION, Pick.SIDE, Pick.START)))
+        assertNull(e.missingPick(setOf(Pick.OPERATION, Pick.SIDE, Pick.START, Pick.POINTS)))
+        assertEquals("Pick which way", e.copy(edgeMulti = true).missingPick(setOf(Pick.OPERATION, Pick.SIDE, Pick.START, Pick.POINTS)))
+        assertEquals("Pick a corner", ProbeSetup(ProbeKind.OUTSIDE).missingPick(setOf(Pick.OPERATION)))
+        assertNull(ProbeSetup(ProbeKind.HOLE).missingPick(setOf(Pick.OPERATION)))
     }
 
     @Test fun insideCornerBackLeft() {

@@ -163,8 +163,12 @@ class RunController(
         prefs.edit {
             putInt("run.gridX", s.gridX); putInt("run.gridY", s.gridY); putFloat("run.clearance", s.clearance.toFloat())
             putFloat("run.inset", s.levelInset.toFloat())
+            if (s.origin == Origin.CUSTOM) s.anchor?.let { putString("run.anchorId", it.id) }
         }
     }
+
+    /** The custom anchor picked last time (its id), to preselect in the dropdown. */
+    fun lastAnchorId(): String? = prefs.getString("run.anchorId", null)
 
     fun back() { error.value = null; if (step.value > 0) step.value -= 1 else close() }
 
@@ -183,6 +187,9 @@ class RunController(
         return (x to y).also { anchor.value = it }
     }
 
+    /** Read Anchor 1 from the machine if it isn't known yet (Settings › Anchors shows it). */
+    fun loadAnchor1() { scope.launch { readAnchor() } }
+
     private val configWait = HashMap<String, CompletableDeferred<Double>>()
 
     /** A number from the SD config (`config-get sd <key>`), or null if it isn't there (4 s timeout). */
@@ -200,6 +207,10 @@ class RunController(
             (it.mpos.getOrNull(1) ?: return null) - (it.wpos.getOrNull(1) ?: 0.0) }
         return when (s.origin) {
             Origin.ANCHOR1 -> anchor.value?.let { (ax, ay) -> (ax + s.offX) to (ay + s.offY) }
+            // An anchor may give only X or only Y (an edge): the other stays where it is now.
+            Origin.CUSTOM -> s.anchor?.let { a ->
+                (a.x?.plus(s.aOffX) ?: cur?.first ?: return null) to (a.y?.plus(s.aOffY) ?: cur?.second ?: return null)
+            }
             Origin.SPINDLE -> if (applied.value?.origin == Origin.SPINDLE) cur else st?.let { it.mpos[0] to it.mpos[1] }
             else -> cur
         }
@@ -227,8 +238,9 @@ class RunController(
         if (probeNeeded()) return                                   // the screen opens the probe wizard instead
         if (step.value == 0) {
             val s = setup.value
-            val needSend = s.origin == Origin.ANCHOR1 || s.origin == Origin.SPINDLE
-            val same = applied.value?.let { it.origin == s.origin && it.offX == s.offX && it.offY == s.offY } == true
+            if (s.origin == Origin.CUSTOM && s.anchor == null) { error.value = "Pick an anchor, or save one in Settings › Anchors."; return }
+            val needSend = s.origin == Origin.ANCHOR1 || s.origin == Origin.SPINDLE || s.origin == Origin.CUSTOM
+            val same = applied.value?.let { originKey(it) == originKey(s) } == true
             if (needSend && !same) {
                 ready(link.status.value)?.let { error.value = it; return }
                 scope.launch {
@@ -236,7 +248,7 @@ class RunController(
                         error.value = "Couldn't read Anchor 1's position from the machine."; return@launch
                     } else null
                     val lines = RunCommands.originLines(s, a)
-                    log("▶ run: origin ${s.origin.label}")
+                    log("▶ run: origin ${s.origin.label}" + (s.anchor?.takeIf { s.origin == Origin.CUSTOM }?.let { " ${it.name}" } ?: ""))
                     lines.forEach { link.sendLine(it) }
                     applied.value = s
                     step.value = 1
@@ -247,7 +259,9 @@ class RunController(
         if (step.value < 3) step.value += 1
     }
 
-    /** The 3D probe wizard came back. */
+    /** What decides the origin commands: Next sends them again only when one of these changed. */
+    private fun originKey(s: RunSetup) = listOf(s.origin, s.offX, s.offY, s.anchor, s.aOffX, s.aOffY, s.anchorSetsZ)
+
     /** Next would open the 3D probe: Custom origin picked and no zero set with it yet. */
     fun probeNeeded() = step.value == 0 && setup.value.origin == Origin.PROBE3D && !probed3d.value
 

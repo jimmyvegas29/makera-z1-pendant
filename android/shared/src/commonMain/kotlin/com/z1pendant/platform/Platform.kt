@@ -16,6 +16,8 @@ interface Platform {
     val haptics: Haptics
     /** Held while listening for discovery broadcasts (Android: Wi-Fi multicast lock). Returns the release. */
     fun holdDiscoveryLock(): () -> Unit = {}
+    /** App updates: the GitHub check, and (Android) download and install. */
+    val updater: com.z1pendant.update.Updater get() = com.z1pendant.update.Updater.None
 }
 
 /** Key/value settings with SharedPreferences semantics (missing key = the default). */
