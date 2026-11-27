@@ -165,7 +165,25 @@ tap a jog pad, run your own hotkeys, and see live positions, all over Wi-Fi with
   <img src="docs/screenshots/13_probe_position.png" width="160" alt="Move the probe into place">
   <img src="docs/screenshots/14_probe_running.png" width="160" alt="Probing an outside corner">
   <img src="docs/screenshots/15_probe_result.png" width="160" alt="Work zero set">
-  <br><sub>Probing: pick the probe, the operation and the axes, check the probe, move it into place, probe, result.</sub>
+  <br><sub>Probing: pick the probe, the operation and the axes, check the probe, move it into place (the map button gets you there quicker), probe, result.</sub>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/28_edge_setup.png" width="160" alt="Edge: right edge, start from here, multiple points toward the front">
+  <img src="docs/screenshots/29_edge_settings.png" width="160" alt="Edge settings: search distance, 5 points over 32 mm, inside travel">
+  <img src="docs/screenshots/30_edge_probing.png" width="160" alt="Probing touch 4 of 5 along the right edge">
+  <img src="docs/screenshots/31_edge_result.png" width="160" alt="Edge result: 0.30 degrees out, straightness 0.020 mm">
+  <img src="docs/screenshots/32_edge_straightness.png" width="160" alt="Straightness: each touch against the best-fit line">
+  <br><sub>Edge probing: started beside the part, five touches along the right edge, then how far out of square and how straight it is.</sub>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/33_map.png" width="160" alt="Bed map: grid, anchor on X0 Y0, tool setter, spindle">
+  <img src="docs/screenshots/34_map_pick.png" width="160" alt="Bed map: the anchor and X0 Y0 picked, Safe Z, Move here">
+  <img src="docs/screenshots/27_save_anchor.png" width="160" alt="Save as anchor after probing, with the X Y Z to keep">
+  <img src="docs/screenshots/36_anchors.png" width="160" alt="Settings, Anchors: saved anchors and Anchor 1">
+  <img src="docs/screenshots/35_settings_app.png" width="160" alt="Settings: Anchors, and App with the update check">
+  <br><sub>The bed map, Save as anchor on a probe result, the saved anchors, and Settings with the update check.</sub>
 </p>
 
 <p align="center">
@@ -177,7 +195,7 @@ tap a jog pad, run your own hotkeys, and see live positions, all over Wi-Fi with
 <p align="center">
   <img src="docs/screenshots/16_files.png" width="160" alt="Files: the SD card, and a file's sheet with Run">
   <img src="docs/screenshots/26_upload.png" width="160" alt="Upload to the Z1: choose a file, or Cancel">
-  <img src="docs/screenshots/17_run_origin.png" width="160" alt="Run: the origin, with the bed map">
+  <img src="docs/screenshots/17_run_origin.png" width="160" alt="Run: the origin, a custom anchor with its saved Z">
   <img src="docs/screenshots/18_run_checks.png" width="160" alt="Run: Z probe, margin scan and auto leveling">
   <img src="docs/screenshots/19_run_summary.png" width="160" alt="Run: time, tools and the precheck routine">
   <br><sub>Files and the upload sheet, then Run: the origin, the checks, and the summary with Start job.</sub>
