@@ -10,7 +10,7 @@ import platform.Foundation.NSURLSession
 import platform.Foundation.NSUTF8StringEncoding
 import platform.Foundation.create
 import platform.Foundation.dataTaskWithRequest
-import platform.Foundation.setTimeoutInterval
+import platform.Foundation.NSURLSessionConfiguration
 import platform.Foundation.setValue
 import platform.UIKit.UIApplication
 import kotlin.coroutines.resume
@@ -27,9 +27,10 @@ class IosUpdater : Updater {
         val req = NSMutableURLRequest.requestWithURL(nsUrl)
         req.setValue("Z1-Pendant/${BuildInfo.VERSION}", forHTTPHeaderField = "User-Agent")
         req.setValue("application/vnd.github+json", forHTTPHeaderField = "Accept")
-        // NSMutableURLRequest's writable timeout comes through as a setter function in Kotlin/Native.
-        req.setTimeoutInterval(20.0)
-        val task = NSURLSession.sharedSession.dataTaskWithRequest(req) { data, response, error ->
+        // The 20 s timeout on the session (NSMutableURLRequest's timeoutInterval is read-only in Kotlin/Native).
+        val config = NSURLSessionConfiguration.defaultSessionConfiguration
+        config.timeoutIntervalForRequest = 20.0
+        val task = NSURLSession.sessionWithConfiguration(config).dataTaskWithRequest(req) { data, response, error ->
             val code = (response as? NSHTTPURLResponse)?.statusCode?.toInt() ?: 0
             when {
                 error != null -> cont.resumeWithException(Exception(error.localizedDescription))
